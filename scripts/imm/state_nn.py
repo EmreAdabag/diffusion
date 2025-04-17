@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
-import torchvision
 import math
-from typing import Union, Callable
-from tqdm.auto import tqdm
+from typing import Union
+from tqdm import tqdm
+
 
 class IMMloss(nn.Module):
     """
@@ -292,8 +292,8 @@ class ConditionalUnet1D(nn.Module):
             global_cond):
         """
         x: (B,T,input_dim)
-        timestep: (B,), diffusion step
-        timestep_s: (B,), diffusion step s (for IMM)
+        timestep: (B,) or int, diffusion step t
+        timestep_s: (B,) or int, diffusion step s (for IMM)
         global_cond: (B,global_cond_dim)
         output: (B,T,input_dim)
         """
@@ -301,7 +301,7 @@ class ConditionalUnet1D(nn.Module):
         sample = sample.moveaxis(-1,-2)
         # (B,C,T)
 
-        # 1. time
+        # 1. time embedding for t
         # timesteps = timestep
         # if not torch.is_tensor(timesteps):
         #     # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
@@ -310,12 +310,15 @@ class ConditionalUnet1D(nn.Module):
         #     timesteps = timesteps[None].to(sample.device)
         # # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
         # timesteps = timesteps.expand(sample.shape[0])
-
+        
+        # Get time embedding for t
         t_emb = self.diffusion_step_encoder(timestep)
+        
+        # 2. time embedding for s
         s_emb = self.diffusion_step_encoder_s(timestep_s)
-
+        
+        # Combine t and s embeddings
         global_feature = torch.cat([t_emb, s_emb], dim=-1)
-
 
         if global_cond is not None:
             global_feature = torch.cat([
@@ -345,75 +348,6 @@ class ConditionalUnet1D(nn.Module):
         x = x.moveaxis(-1,-2)
         # (B,T,C)
         return x
-    
-
-''' Vision Encoder '''
-def get_resnet(name:str, weights=None, **kwargs) -> nn.Module:
-    """
-    name: resnet18, resnet34, resnet50
-    weights: "IMAGENET1K_V1", None
-    """
-    # Use standard ResNet implementation from torchvision
-    func = getattr(torchvision.models, name)
-    resnet = func(weights=weights, **kwargs)
-
-    # remove the final fully connected layer
-    # for resnet18, the output dim should be 512
-    resnet.fc = torch.nn.Identity()
-    return resnet
-
-
-def replace_submodules(
-        root_module: nn.Module,
-        predicate: Callable[[nn.Module], bool],
-        func: Callable[[nn.Module], nn.Module]) -> nn.Module:
-    """
-    Replace all submodules selected by the predicate with
-    the output of func.
-
-    predicate: Return true if the module is to be replaced.
-    func: Return new module to use.
-    """
-    if predicate(root_module):
-        return func(root_module)
-
-    bn_list = [k.split('.') for k, m
-        in root_module.named_modules(remove_duplicate=True)
-        if predicate(m)]
-    for *parent, k in bn_list:
-        parent_module = root_module
-        if len(parent) > 0:
-            parent_module = root_module.get_submodule('.'.join(parent))
-        if isinstance(parent_module, nn.Sequential):
-            src_module = parent_module[int(k)]
-        else:
-            src_module = getattr(parent_module, k)
-        tgt_module = func(src_module)
-        if isinstance(parent_module, nn.Sequential):
-            parent_module[int(k)] = tgt_module
-        else:
-            setattr(parent_module, k, tgt_module)
-    # verify that all modules are replaced
-    bn_list = [k.split('.') for k, m
-        in root_module.named_modules(remove_duplicate=True)
-        if predicate(m)]
-    assert len(bn_list) == 0
-    return root_module
-
-def replace_bn_with_gn(
-    root_module: nn.Module,
-    features_per_group: int=16) -> nn.Module:
-    """
-    Relace all BatchNorm layers with GroupNorm.
-    """
-    replace_submodules(
-        root_module=root_module,
-        predicate=lambda x: isinstance(x, nn.BatchNorm2d),
-        func=lambda x: nn.GroupNorm(
-            num_groups=x.num_features//features_per_group,
-            num_channels=x.num_features)
-    )
-    return root_module
 
 class RoboIMM:
     """
@@ -429,43 +363,20 @@ class RoboIMM:
         """
         Initialize the IMM sampler.
         """
+
+        self.obs_dim = 5
+        self.action_dim = 2
         self.sigma_data = sigma_data
         self.obs_horizon = obs_horizon
         self.pred_horizon = pred_horizon
         self.num_particles = num_particles
-        
-        # construct ResNet18 encoder
-        # if you have multiple camera views, use seperate encoder weights for each view.
-        vision_encoder = get_resnet('resnet18')
 
-        # IMPORTANT!
-        # replace all BatchNorm with GroupNorm to work with EMA
-        # performance will tank if you forget to do this!
-        vision_encoder = replace_bn_with_gn(vision_encoder)
-
-        # ResNet18 has output dim of 512
-        vision_feature_dim = 512
-        # agent_pos is 2 dimensional
-        lowdim_obs_dim = 2
-        # observation feature has 514 dims in total per step
-        self.obs_dim = vision_feature_dim + lowdim_obs_dim
-        self.action_dim = 2
-
-        # create network object
-        noise_pred_net = ConditionalUnet1D(
+        self.model = ConditionalUnet1D(
             input_dim=self.action_dim,
             global_cond_dim=self.obs_dim*self.obs_horizon
         )
-
-        # the final arch has 2 parts
-        nets = nn.ModuleDict({
-            'vision_encoder': vision_encoder,
-            'noise_net': noise_pred_net
-        })
         device = torch.device('cuda')
-        nets = nets.to(device)
-        
-        self.nets = nets
+        self.model = self.model.to(device)
 
         self.loss = IMMloss(obs_horizon=obs_horizon, pred_horizon=pred_horizon, num_particles=num_particles)
 
@@ -475,6 +386,20 @@ class RoboIMM:
         alpha_t = (1 - t)
         sigma_t = t
         return alpha_t, sigma_t
+    
+    # def euler_step(self, yt, pred, t, s):
+    #     """Euler step for flow matching."""
+    #     return yt - (t - s) * self.sigma_data * pred
+    
+    # def edm_step(self, yt, pred, t, s):
+    #     """EDM step for sampling."""
+    #     alpha_t, sigma_t = self.get_alpha_sigma(t)
+    #     alpha_s, sigma_s = self.get_alpha_sigma(s)
+         
+    #     c_skip = (alpha_t * alpha_s + sigma_t * sigma_s) / (alpha_t**2 + sigma_t**2)
+    #     c_out = -(alpha_s * sigma_t - alpha_t * sigma_s) * (alpha_t**2 + sigma_t**2).rsqrt() * self.sigma_data
+        
+    #     return c_skip * yt + c_out * pred
     
     def ddim(self, yt, y, s, t):
         alpha_t, sigma_t = self.get_alpha_sigma(t)
@@ -488,7 +413,7 @@ class RoboIMM:
         ys = (alpha_s -   alpha_t * sigma_s / sigma_t) * y + sigma_s / sigma_t * yt
         return ys
     
-    def sample(self, shape, image, agent_pos, steps=20, sampling_method="ddim"):
+    def sample(self, shape, steps=20, global_cond=None, sampling_method="ddim"):
         """
         Generate samples using IMM sampling.
         
@@ -501,27 +426,15 @@ class RoboIMM:
         Returns:
             Generated samples
         """
-        device = next(self.nets.parameters()).device
-        self.nets.eval()
-        image = image.to(device)
-        agent_pos = agent_pos.to(device)
+        device = next(self.model.parameters()).device
+        self.model.eval()
         
-        # vision encoder
-        image_features = self.nets['vision_encoder'](image.flatten(end_dim=1))
-        
-        # (2,512)
-        image_features = image_features.reshape(*image.shape[:2],-1)
-        
-        # (1,2,512)
-        
-        obs = torch.cat([image_features, agent_pos],dim=-1)
-        # (1,2,514)
-
+        # Initialize with noise
         x = torch.randn(shape, device=device) * self.sigma_data
         
         # Define time steps (uniform steps from 1 to 0)
         times = torch.linspace(0.994, 0.006, steps + 1, device=device)
-                
+        
         for i in range(steps):
             t = times[i]
             s = times[i + 1]
@@ -532,12 +445,7 @@ class RoboIMM:
             
             # Run model forward
             with torch.no_grad():
-                x = self.predict(x, t_batch, s_batch, obs.flatten(start_dim=1))
-                # noise = nets['noise_pred_net'](
-                #     sample=noised_action,
-                #     timestep=diffusion_iter,
-                #     timestep_s=diffusion_iter,
-                #     global_cond=)
+                x = self.predict(x, t_batch, s_batch, global_cond)
             
             # Apply sampling function based on method
             # if sampling_method == "ddim":
@@ -568,7 +476,6 @@ class RoboIMM:
         return 0.5 * sigmoid_term * -1.0 * dlog_snr_t * snr_term
     
     def predict(self, xt, t, s, obs_cond):
-        pass
         c = 1000.0
         cskip = 1.0
         cout = -(t-s) * self.sigma_data
@@ -576,41 +483,35 @@ class RoboIMM:
         c_timestep_s = c * s
         alpha_t, sigma_t = self.get_alpha_sigma(t)
         c_in = (torch.pow(alpha_t, 2) + torch.pow(sigma_t, 2)).rsqrt() / self.sigma_data
-        xs = self.nets['noise_net'](xt*c_in.reshape(-1,1,1), c_timestep, c_timestep_s, obs_cond)
+        xs = self.model(xt*c_in.reshape(-1,1,1), c_timestep, c_timestep_s, obs_cond)
         return cskip * xt + cout.reshape(-1,1,1) * xs
 
     def train(self, train_loader, val_loader, num_epochs=100, lr=1e-4, device='cuda'):
         """
         Train the model.
         """
+
         # Standard ADAM optimizer
         # Note that EMA parametesr are not optimized
         optimizer = torch.optim.AdamW(
-            params=self.nets.parameters(),
+            params=self.model.parameters(),
             lr=lr, weight_decay=0)
 
         # Cosine LR schedule
         lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, num_epochs)
 
-        self.nets.train()
+        self.model.train()
         
         with tqdm(range(num_epochs), desc='Epoch') as tglobal:
             # epoch loop
             for epoch_idx in tglobal:
                 # batch loop
                 with tqdm(train_loader, desc='Batch', leave=False) as tepoch:
-                    for batch_idx, nbatch in enumerate(tepoch):
-                        nimage = nbatch['image'][:,:self.obs_horizon].to(device)
-                        nagent_pos = nbatch['agent_pos'][:,:self.obs_horizon].to(device)
-                        naction = nbatch['action'].to(device)
-                        B = nagent_pos.shape[0]
+                    for batch_idx, batch in enumerate(tepoch):
+                        nobs = batch['obs'].to(device)
+                        naction = batch['action'].to(device)
+                        B = nobs.shape[0]
 
-                        # get vision features
-                        image_features = self.nets['vision_encoder'](
-                        nimage.flatten(end_dim=1))
-                        image_features = image_features.reshape(*nimage.shape[:2],-1)
-
-                        # get times
                         num_groups = B // self.num_particles
                         s_times = torch.rand(num_groups, device=device)
                         t_times = s_times + (1 - s_times) * torch.rand(num_groups, device=device)
@@ -622,19 +523,22 @@ class RoboIMM:
                         r_times = r_times.reshape(-1,1).expand(num_groups, self.num_particles).reshape(-1)
 
                         noise = torch.randn_like(naction) * self.sigma_data
-                        
+
                         x_t = self.ddim(yt=noise, y=naction, s=t_times, t=torch.ones_like(t_times))
                         x_r = self.ddim(yt=x_t, y=naction, s=r_times, t=t_times)
-                        
-
-                        obs_features = torch.cat([image_features, nagent_pos], dim=-1)
-                        obs_cond = obs_features.flatten(start_dim=1)
-                        
+                                                
+                        # observation as FiLM conditioning
+                        # (B, obs_horizon, obs_dim)
+                        obs_cond = nobs[:,:self.obs_horizon,:]
+                        # (B, obs_horizon * obs_dim)
+                        obs_cond = obs_cond.flatten(start_dim=1)
 
                         optimizer.zero_grad()
+                        # pred_grad = self.model(x_t, t_times, s_times, obs_cond)
                         pred_grad = self.predict(x_t, t_times, s_times, obs_cond)
 
                         with torch.no_grad():
+                            # pred_nograd = self.model(x_r, r_times, s_times, obs_cond)
                             pred_nograd = self.predict(x_r, r_times, s_times, obs_cond)
     
                         time_weights = self.calculate_weights(s_times, t_times)
@@ -659,15 +563,15 @@ class RoboIMM:
 
                         if batch_idx % 10 == 0:
                             print(f"Epoch {epoch_idx}, Batch {batch_idx}, Loss: {loss.item()}")
-                        if batch_idx == 0 and epoch_idx % 10 == 0:
+                        if batch_idx % 100 == 0 and epoch_idx % 10 == 0:
                             # save model checkpoint
                             torch.save({
                                 'epoch': epoch_idx,
-                                'model_state_dict': self.nets.state_dict(),
+                                'model_state_dict': self.model.state_dict(),
                                 'optimizer_state_dict': optimizer.state_dict(),
                                 'loss': loss.item()
                             }, f"ckpts/model_checkpoint_{epoch_idx}_{batch_idx}_{loss.item()}.pth")
-    
+
     def load_model(self, path):
         state_dict = torch.load(path, map_location='cuda')
-        self.nets.load_state_dict(state_dict['model_state_dict'])
+        self.model.load_state_dict(state_dict['model_state_dict'])

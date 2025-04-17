@@ -22,8 +22,16 @@ import cv2
 import os
 from pusht_env import PushTImageEnv
 #from flow_matching_vision_based import VisionEncoder, ConditionalUnet1D, ShortcutModel
+import math
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# Check for different GPU backends
+if torch.cuda.is_available():
+    device = torch.device('cuda')
+elif hasattr(torch, 'hip') and torch.hip.is_available():  # AMD GPUs with ROCm
+    device = torch.device('hip')
+else:
+    device = torch.device('cpu')
+    
 print(f"Using device: {device}")
 
 class PushTImageDataset(torch.utils.data.Dataset):
@@ -38,7 +46,7 @@ class PushTImageDataset(torch.utils.data.Dataset):
         train_data = {
             # (N, action_dim)
             'action': dataset_root['data']['action'][:],
-            # (N, obs_dim)
+            # (N, H, W, C)
             'image': dataset_root['data']['img'][:],  # Changed from 'images' to 'img'
             'agent_pos': dataset_root['data']['state'][:,0:2]  # First two dimensions of state are agent position
         }
@@ -67,7 +75,8 @@ class PushTImageDataset(torch.utils.data.Dataset):
         stats['action'] = get_data_stats(train_data['action'])
         normalized_train_data['action'] = normalize_data(train_data['action'], stats['action'])
         
-        # Normalize images to [-1, 1]
+        # Normalize images to [-1, 1] - same as state-based normalization
+        # First convert uint8 [0, 255] to float32 [-1, 1]
         normalized_train_data['image'] = train_data['image'].astype(np.float32) / 127.5 - 1.0
         
         # Normalize agent positions
@@ -176,31 +185,49 @@ class VisionEncoder(nn.Module):
         super().__init__()
         self.obs_horizon = obs_horizon
         
-        # Improved CNN encoder with better architecture
+        # Enhanced CNN encoder with deeper architecture and residual connections
         self.encoder = nn.Sequential(
             # Input: (batch_size, channels, image_size, image_size)
             nn.Conv2d(input_channels, 32, kernel_size=3, stride=2, padding=1),
             nn.GroupNorm(8, 32),
             nn.Mish(),
             
+            # First residual block
             nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
             nn.GroupNorm(8, 64),
             nn.Mish(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.GroupNorm(8, 64),
+            nn.Mish(),
             
+            # Second residual block
             nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
             nn.GroupNorm(8, 128),
             nn.Mish(),
+            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1),
+            nn.GroupNorm(8, 128),
+            nn.Mish(),
             
+            # Third residual block
             nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
             nn.GroupNorm(8, 256),
             nn.Mish(),
+            nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1),
+            nn.GroupNorm(8, 256),
+            nn.Mish(),
             
+            # Fourth residual block
             nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(8, 512),
+            nn.Mish(),
+            nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=1),
             nn.GroupNorm(8, 512),
             nn.Mish(),
             
             nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
+            nn.Linear(512, 512),
+            nn.Mish(),
             nn.Linear(512, output_dim)
         )
     
@@ -213,6 +240,7 @@ class VisionEncoder(nn.Module):
             for t in range(T):
                 # Permute dimensions to (batch_size, channels, height, width)
                 x_t = x[:, t].permute(0, 3, 1, 2)
+                # Image should already be normalized consistently outside
                 feat = self.encoder(x_t)
                 features.append(feat)
             # Stack features along time dimension
@@ -223,13 +251,20 @@ class VisionEncoder(nn.Module):
             # Single image case
             # Permute dimensions to (batch_size, channels, height, width)
             x = x.permute(0, 3, 1, 2)
+            # Image should already be normalized consistently outside
             x = self.encoder(x)
         return x
 
 class VisionShortcutModel():
     def __init__(self, model=None, vision_encoder=None, num_steps=1000, device='cuda'):
         self.model = model
+        if self.model is not None:
+            self.model = self.model.to(device)
+            
         self.vision_encoder = vision_encoder
+        if self.vision_encoder is not None:
+            self.vision_encoder = self.vision_encoder.to(device)
+            
         self.N = num_steps
         self.device = device
 
@@ -282,6 +317,14 @@ class VisionShortcutModel():
             distance: Zero distance for regular flow matching 
             global_cond: Encoded observations
         """
+        # Move inputs to device if they're not already there
+        if z0 is not None and z0.device != self.device:
+            z0 = z0.to(self.device)
+        if z1 is not None and z1.device != self.device:
+            z1 = z1.to(self.device)
+        if obs is not None and obs.device != self.device:
+            obs = obs.to(self.device)
+        
         B = z0.shape[0]
         distance = torch.zeros((B,), device=z0.device)
         # Sample t uniformly from [0, 1]
@@ -314,31 +357,35 @@ class VisionShortcutModel():
             global_cond: Encoded observations
         """
         B = z0.shape[0]
-        # Sample log distance for shortcut training
+        
+        # Sample log distance with same logic as state-based implementation
         log_distance = torch.randint(low=0, high=7, size=(B,), device=z0.device).float()
         distance = torch.pow(2, -1 * log_distance).to(z0.device)
         
         # Sample t uniformly from [0, 1]
         t = torch.rand((B,), device=z0.device)
         t_view = t.view(B, 1, 1)
+        
+        # Linear interpolation between z0 and z1 at time t
         z_t = t_view * z1 + (1 - t_view) * z0
         
         # Encode observations
         global_cond = self.vision_encoder(obs)
         
-        # Predict vector field at t
+        # Step 1: Predict vector field at current state
         s_t = self.model(z_t, t, distance=distance, global_cond=global_cond)
         
-        # Advance to t + distance
+        # Step 2: Advance state to t + distance
         z_tpd = z_t + s_t * distance.view(B, 1, 1)
         tpd = t + distance
         
-        # Predict vector field at t + distance
+        # Step 3: Predict vector field at advanced state
         s_tpd = self.model(z_tpd, tpd, distance=distance, global_cond=global_cond)
         
-        # Target is average of the two vector fields
+        # Step 4: Target is average of the two vector fields
         target = (s_t.detach().clone() + s_tpd.detach().clone()) / 2
-
+        
+        # Match state-based by multiplying distance by 2
         return z_t, t, target, distance * 2, global_cond
 
     @torch.no_grad()
@@ -349,156 +396,274 @@ class VisionShortcutModel():
         Args:
             z0: Initial noise tensor of shape (batch_size, sequence_length, feature_dim)
             obs: Observation tensor of shape (batch_size, obs_horizon, height, width, channels)
-            N: Number of steps to take
+            N: Number of steps to take (typically small, like 2, for evaluation)
             
         Returns:
             traj: List of tensors representing the trajectory
         """
         if N is None:
             N = self.N
-        dt = 1. / N
-        traj = []
+            
+        # Use a smaller dt for better accuracy
+        dt = 1.0 / N
+        
+        # Initialize trajectory list with the initial point
+        traj = [z0.detach().clone()]
         z = z0.detach().clone()
         B = z.shape[0]
         
         # Create a tensor for dt with the right shape and device
         dt_tensor = torch.ones((B,), device=self.device) * dt
         
-        # Encode observations
+        # Encode observations - do this just once for efficiency
         global_cond = self.vision_encoder(obs)
         
-        traj.append(z.detach().clone())
-        
+        # Sample the ODE trajectory
         for i in range(N):
+            # Current time in [0,1]
             t = torch.ones((B,), device=self.device) * i / N
-            # Predict vector field at current t
+            
+            # Predict the vector field at the current state
             pred = self.model(z, t, distance=dt_tensor, global_cond=global_cond)
-            # Update z using Euler method
+            
+            # Update the state using Euler's method
             z = z.detach().clone() + pred * dt
+            
+            # Add the new state to the trajectory
             traj.append(z.detach().clone())
-
+            
         return traj
 
 class ConditionalUnet1D(nn.Module):
-    def __init__(self, input_dim=2, global_cond_dim=None):
+    def __init__(self,
+        input_dim,
+        global_cond_dim,
+        diffusion_step_embed_dim=256,
+        down_dims=[256,512,1024],
+        kernel_size=5,
+        n_groups=8
+        ):
+        """
+        input_dim: Dim of actions.
+        global_cond_dim: Dim of global conditioning applied with FiLM
+          in addition to diffusion step embedding. This is usually obs_horizon * obs_dim
+        diffusion_step_embed_dim: Size of positional encoding for diffusion iteration k
+        down_dims: Channel size for each UNet level.
+          The length of this array determines numebr of levels.
+        kernel_size: Conv kernel size
+        n_groups: Number of groups for GroupNorm
+        """
+
         super().__init__()
-        
-        # Save input parameters
-        self.input_dim = input_dim
-        self.global_cond_dim = global_cond_dim
-        
-        # Size of hidden layers
-        hidden_dim = 256
-        
-        # Conditioning dimensions
-        cond_dim = 128
         
         # Time embedding
         self.time_embed = nn.Sequential(
-            nn.Linear(1, cond_dim),
-            nn.SiLU(),
-            nn.Linear(cond_dim, cond_dim),
+            SinusoidalPosEmb(diffusion_step_embed_dim),
+            nn.Linear(diffusion_step_embed_dim, diffusion_step_embed_dim * 4),
+            nn.Mish(),
+            nn.Linear(diffusion_step_embed_dim * 4, diffusion_step_embed_dim),
         )
         
-        # Distance embedding (for shortcut model)
+        # Distance embedding
         self.dist_embed = nn.Sequential(
-            nn.Linear(1, cond_dim),
-            nn.SiLU(),
-            nn.Linear(cond_dim, cond_dim),
+            SinusoidalPosEmb(diffusion_step_embed_dim),
+            nn.Linear(diffusion_step_embed_dim, diffusion_step_embed_dim * 4),
+            nn.Mish(),
+            nn.Linear(diffusion_step_embed_dim * 4, diffusion_step_embed_dim),
         )
         
         # Global conditioning projection
-        if global_cond_dim is not None:
-            self.global_proj = nn.Sequential(
-                nn.Linear(global_cond_dim, cond_dim),
-                nn.SiLU(),
-                nn.Linear(cond_dim, cond_dim),
-            )
+        self.global_proj = nn.Sequential(
+            nn.Linear(global_cond_dim, diffusion_step_embed_dim * 4),
+            nn.Mish(),
+            nn.Linear(diffusion_step_embed_dim * 4, diffusion_step_embed_dim),
+        )
         
-        # Embed action
+        # Input embedding
         self.input_embed = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.SiLU()
+            nn.Conv1d(input_dim, down_dims[0], kernel_size=kernel_size, padding=kernel_size//2),
         )
         
-        # Combine embeddings and process with MLP
-        combined_dim = hidden_dim + cond_dim
-        if global_cond_dim is not None:
-            combined_dim += cond_dim
-            
+        # MLP backbone
         self.mlp = nn.Sequential(
-            nn.Linear(combined_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, input_dim)
+            nn.Linear(down_dims[0] + diffusion_step_embed_dim * 3, down_dims[0] * 2),
+            nn.Mish(),
+            nn.Linear(down_dims[0] * 2, down_dims[0] * 2),
+            nn.Mish(),
+            nn.Linear(down_dims[0] * 2, down_dims[0] * 2),
+            nn.Mish(),
+            nn.Linear(down_dims[0] * 2, down_dims[0]),
+            nn.Mish(),
+            nn.Linear(down_dims[0], input_dim),
         )
-    
-    def forward(self, x, t, distance=None, global_cond=None):
-        # Get batch size and sequence length
-        batch_size = x.shape[0]
-        seq_len = x.shape[1] if x.dim() > 2 else 1
-        feature_dim = x.shape[-1]
         
-        # If action is 3D (batch, seq, feat), flatten sequence and feature for processing
-        # Otherwise, keep as is (batch, feat)
-        if x.dim() == 3:
-            # Reshape to (batch*seq, feat)
-            x_flat = x.reshape(-1, feature_dim)
+        print("number of parameters: {:e}".format(
+            sum(p.numel() for p in self.parameters()))
+        )
+
+    def forward(self,
+            sample: torch.Tensor,
+            timestep: Union[torch.Tensor, float, int],
+            distance=None,
+            global_cond=None):
+        """
+        x: (B,T,input_dim)
+        timestep: (B,) or int, diffusion step
+        global_cond: (B,global_cond_dim)
+        output: (B,T,input_dim)
+        """
+        # (B,T,C)
+        sample_orig = sample
+        sample = sample.moveaxis(-1,-2)
+        # (B,C,T)
+
+        # 1. time
+        timesteps = timestep
+        if not torch.is_tensor(timesteps):
+            timesteps = torch.tensor([timesteps], dtype=torch.long, device=sample.device)
+        elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
+            timesteps = timesteps[None].to(sample.device)
+        # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+        timesteps = timesteps.expand(sample.shape[0])
+
+        if distance is None:
+            distance = torch.zeros_like(timesteps, device=sample.device)
         else:
-            x_flat = x
+            if not torch.is_tensor(distance):
+                distance = torch.tensor([distance], dtype=torch.long)
+            elif torch.is_tensor(distance) and len(distance.shape) == 0:
+                distance = distance[None]
+            # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+            distance = distance.expand(sample.shape[0]).to(sample.device)
+
+        # Time and distance embeddings
+        t_emb = self.time_embed(timesteps)  # (B, diffusion_step_embed_dim)
+        d_emb = self.dist_embed(distance)   # (B, diffusion_step_embed_dim)
         
-        # Embed time and expand if needed
-        t_embed = self.time_embed(t.view(-1, 1))  # (batch, embed_dim)
+        # Global conditioning
+        g_emb = self.global_proj(global_cond) if global_cond is not None else torch.zeros_like(t_emb)
         
-        # If processing sequence, expand time embedding to match
-        if x.dim() == 3:
-            t_embed = t_embed.unsqueeze(1).expand(-1, seq_len, -1)  # (batch, seq, embed_dim)
-            t_embed = t_embed.reshape(-1, t_embed.size(-1))  # (batch*seq, embed_dim)
+        # Initial feature extraction from input
+        x = self.input_embed(sample)  # (B, down_dims[0], T)
         
-        # Embed distance if provided (for shortcut model)
-        if distance is not None:
-            d_embed = self.dist_embed(distance.view(-1, 1))  # (batch, embed_dim)
-            
-            # If processing sequence, expand distance embedding to match
-            if x.dim() == 3:
-                d_embed = d_embed.unsqueeze(1).expand(-1, seq_len, -1)  # (batch, seq, embed_dim)
-                d_embed = d_embed.reshape(-1, d_embed.size(-1))  # (batch*seq, embed_dim)
-                
-            t_embed = t_embed + d_embed
-            
-        # Project global conditioning if provided
-        if global_cond is not None and self.global_cond_dim is not None:
-            g_embed = self.global_proj(global_cond)  # (batch, embed_dim)
-            
-            # If processing sequence, expand global conditioning to match
-            if x.dim() == 3:
-                g_embed = g_embed.unsqueeze(1).expand(-1, seq_len, -1)  # (batch, seq, embed_dim)
-                g_embed = g_embed.reshape(-1, g_embed.size(-1))  # (batch*seq, embed_dim)
-        else:
-            g_embed = None
+        # Reshape for MLP processing
+        B, C, T = x.shape
+        x = x.permute(0, 2, 1)  # (B, T, C)
+        x = x.reshape(B * T, C)  # (B*T, C)
         
-        # Embed action
-        h = self.input_embed(x_flat)  # (batch*seq, hidden_dim) or (batch, hidden_dim)
+        # Expand condition embeddings for each timestep
+        t_emb = t_emb.unsqueeze(1).expand(-1, T, -1).reshape(B * T, -1)  # (B*T, diffusion_step_embed_dim)
+        d_emb = d_emb.unsqueeze(1).expand(-1, T, -1).reshape(B * T, -1)  # (B*T, diffusion_step_embed_dim)
+        g_emb = g_emb.unsqueeze(1).expand(-1, T, -1).reshape(B * T, -1)  # (B*T, diffusion_step_embed_dim)
         
-        # Combine embeddings
-        h_list = [h, t_embed]
-        if g_embed is not None:
-            h_list.append(g_embed)
+        # Concatenate features and condition embeddings
+        x = torch.cat([x, t_emb, d_emb, g_emb], dim=1)  # (B*T, C + 3*diffusion_step_embed_dim)
         
-        h = torch.cat(h_list, dim=-1)
+        # Forward through MLP
+        x = self.mlp(x)  # (B*T, input_dim)
         
-        # Process with MLP
-        out = self.mlp(h)
+        # Reshape back to original dimensions
+        x = x.reshape(B, T, -1)  # (B, T, input_dim)
         
-        # If input was 3D, reshape output back to match
-        if x.dim() == 3:
-            out = out.reshape(batch_size, seq_len, feature_dim)
-            
+        return x
+
+class SinusoidalPosEmb(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        device = x.device
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = x[:, None] * emb[None, :]
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
+        return emb
+
+
+class Downsample1d(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.conv = nn.Conv1d(dim, dim, 3, 2, 1)
+
+    def forward(self, x):
+        return self.conv(x)
+
+class Upsample1d(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.conv = nn.ConvTranspose1d(dim, dim, 4, 2, 1)
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+class Conv1dBlock(nn.Module):
+    '''
+        Conv1d --> GroupNorm --> Mish
+    '''
+
+    def __init__(self, inp_channels, out_channels, kernel_size, n_groups=8):
+        super().__init__()
+
+        self.block = nn.Sequential(
+            nn.Conv1d(inp_channels, out_channels, kernel_size, padding=kernel_size // 2),
+            nn.GroupNorm(n_groups, out_channels),
+            nn.Mish(),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class ConditionalResidualBlock1D(nn.Module):
+    def __init__(self,
+            in_channels,
+            out_channels,
+            cond_dim,
+            kernel_size=3,
+            n_groups=8):
+        super().__init__()
+
+        self.blocks = nn.ModuleList([
+            Conv1dBlock(in_channels, out_channels, kernel_size, n_groups=n_groups),
+            Conv1dBlock(out_channels, out_channels, kernel_size, n_groups=n_groups),
+        ])
+
+        # FiLM modulation https://arxiv.org/abs/1709.07871
+        # predicts per-channel scale and bias
+        cond_channels = out_channels * 2
+        self.out_channels = out_channels
+        self.cond_encoder = nn.Sequential(
+            nn.Mish(),
+            nn.Linear(cond_dim, cond_channels),
+            nn.Unflatten(-1, (-1, 1))
+        )
+
+        # make sure dimensions compatible
+        self.residual_conv = nn.Conv1d(in_channels, out_channels, 1) \
+            if in_channels != out_channels else nn.Identity()
+
+    def forward(self, x, cond):
+        '''
+            x : [ batch_size x in_channels x horizon ]
+            cond : [ batch_size x cond_dim]
+
+            returns:
+            out : [ batch_size x out_channels x horizon ]
+        '''
+        out = self.blocks[0](x)
+        embed = self.cond_encoder(cond)
+
+        embed = embed.reshape(
+            embed.shape[0], 2, self.out_channels, 1)
+        scale = embed[:,0,...]
+        bias = embed[:,1,...]
+        out = scale * out + bias
+
+        out = self.blocks[1](out)
+        out = out + self.residual_conv(x)
         return out
 
 def main():
@@ -506,14 +671,25 @@ def main():
     pred_horizon = 16
     obs_horizon = 2
     action_horizon = 8
-    num_epochs = 20
+    num_epochs = 50
     batch_size = 256
     dataset_path = "pusht_cchi_v7_replay.zarr.zip"
     checkpoint_dir = 'checkpoints'
     checkpoint_freq = 5
+    retrain = True  # Set to True to retrain from scratch
 
     # Create checkpoint directory
     os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    # If retraining, remove existing checkpoints
+    if retrain:
+        import shutil
+        try:
+            shutil.rmtree(checkpoint_dir)
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            print("Removed existing checkpoints for retraining")
+        except Exception as e:
+            print(f"Error removing checkpoints: {e}")
 
     # Create dataset
     try:
@@ -541,19 +717,23 @@ def main():
     # Initialize models
     vision_encoder = VisionEncoder(
         input_channels=3,
-        output_dim=512,  # Increased from 32 to match the improved architecture
-        obs_horizon=obs_horizon  # Pass obs_horizon to VisionEncoder
+        output_dim=512,
+        obs_horizon=obs_horizon
     ).to(device)
     vision_encoder.train()
 
-    # Calculate the actual global conditioning dimension
+    # Calculate the global conditioning dimension
     # When obs_horizon=2, and each image produces 512 features,
     # the total flattened feature dim will be 512*2 = 1024
     global_cond_dim = 512 * obs_horizon
     
+    # Initialize the noise prediction network
     noise_pred_net = ConditionalUnet1D(
         input_dim=2,  # action dimension
-        global_cond_dim=global_cond_dim  # Match vision encoder output dim × obs_horizon
+        global_cond_dim=global_cond_dim,
+        down_dims=[256, 512, 1024],
+        kernel_size=5,
+        n_groups=8
     ).to(device)
     noise_pred_net.train()
 
@@ -568,7 +748,7 @@ def main():
     # Create optimizer with parameters from both model and vision encoder
     optimizer = torch.optim.AdamW(
         list(noise_pred_net.parameters()) + list(vision_encoder.parameters()),
-        lr=1e-4,
+        lr=2e-4,
         weight_decay=1e-1
     )
 
@@ -579,15 +759,20 @@ def main():
         eta_min=1e-6
     )
 
-    # Try to load existing checkpoint
+    # Try to load existing checkpoint if not retraining
     start_epoch = 0
     best_loss = float('inf')
     checkpoint_path = os.path.join(checkpoint_dir, 'latest.pt')
-    if os.path.exists(checkpoint_path):
+    if not retrain and os.path.exists(checkpoint_path):
         print(f"Found checkpoint at {checkpoint_path}")
-        start_epoch, best_loss = flow_model.load_checkpoint(
-            checkpoint_path, optimizer, scheduler)
-        print(f"Resumed from epoch {start_epoch} with loss {best_loss}")
+        try:
+            start_epoch, best_loss = flow_model.load_checkpoint(
+                checkpoint_path, optimizer, scheduler)
+            print(f"Resumed from epoch {start_epoch} with loss {best_loss}")
+        except Exception as e:
+            print(f"Failed to load checkpoint: {e}. Starting from scratch.")
+            start_epoch = 0
+            best_loss = float('inf')
 
     # Training loop
     try:
@@ -634,7 +819,7 @@ def main():
                             
                         # First batch - print shapes for debugging
                         if epoch_idx == 0 and len(rf_epoch_loss) == 0:
-                             print(f"pred: {pred.shape}")
+                            print(f"pred: {pred.shape}")
                             
                         loss = nn.functional.mse_loss(pred, target)
                         loss.backward()
@@ -695,6 +880,12 @@ def main():
                     epoch_idx + 1, optimizer, scheduler, avg_loss,
                     os.path.join(checkpoint_dir, 'latest.pt')
                 )
+                
+                # Fine-tuning phase: reduce learning rate for last 10 epochs
+                if epoch_idx == num_epochs - 11:
+                    print("\nStarting fine-tuning phase with lower learning rate")
+                    for param_group in optimizer.param_groups:
+                        param_group['lr'] = 5e-5  # Much lower learning rate for fine-tuning
 
     except KeyboardInterrupt:
         print("\nTraining interrupted by user")
@@ -710,25 +901,31 @@ def main():
             )
 
 def evaluate():
-    # Evaluation parameters
+    # Evaluation parameters - match state-based exactly
     max_steps = 300
     obs_horizon = 2
     action_horizon = 8
     pred_horizon = 16
+    ode_steps = 8  # Increased from 2 to 8 for better sampling
 
     # Calculate the global conditioning dimension
+    # When obs_horizon=2, and each image produces 512 features,
+    # the total flattened feature dim will be 512*2 = 1024
     global_cond_dim = 512 * obs_horizon
 
     # Load models
     vision_encoder = VisionEncoder(
         input_channels=3,
-        output_dim=512,  # Match the training architecture
+        output_dim=512,
         obs_horizon=obs_horizon
     ).to(device)
     
     noise_pred_net = ConditionalUnet1D(
         input_dim=2,
-        global_cond_dim=global_cond_dim  # Match vision encoder output dim × obs_horizon
+        global_cond_dim=global_cond_dim,
+        down_dims=[256, 512, 1024],
+        kernel_size=5,
+        n_groups=8
     ).to(device)
 
     # Create flow model
@@ -748,16 +945,43 @@ def evaluate():
         return
 
     print(f"Loading checkpoint from {checkpoint_path}")
-    flow_model.load_checkpoint(checkpoint_path)
+    try:
+        # Try loading with both options
+        try:
+            checkpoint = torch.load(checkpoint_path, weights_only=True)
+            print("Successfully loaded checkpoint with weights_only=True")
+        except Exception as e:
+            print(f"Warning: Could not load checkpoint with weights_only=True. Attempting with weights_only=False.")
+            checkpoint = torch.load(checkpoint_path, weights_only=False)
+            print("Successfully loaded checkpoint with weights_only=False")
+            
+        # Manual loading of the model and vision encoder
+        flow_model.model.load_state_dict(checkpoint['model_state_dict'])
+        if flow_model.vision_encoder is not None and checkpoint['vision_encoder_state_dict'] is not None:
+            flow_model.vision_encoder.load_state_dict(checkpoint['vision_encoder_state_dict'])
+    except Exception as e:
+        print(f"Error loading checkpoint: {e}")
+        return
+
+    # Set to evaluation mode
     flow_model.model.eval()
     flow_model.vision_encoder.eval()
 
+    # Try different seeds for evaluation
+    eval_seed = 200000  # Changed from 100000 to try a different seed
     env = PushTImageEnv()
-    env.seed(100000)
+    env.seed(eval_seed)
+    print(f"Evaluating with seed: {eval_seed}")
 
     obs, info = env.reset()
-    obs_deque = collections.deque(
-        [obs] * obs_horizon, maxlen=obs_horizon)
+    
+    # Initialize observation queue properly
+    obs_deque = collections.deque(maxlen=obs_horizon)
+    obs_deque.append(obs)
+    # Fill the queue with the initial observation
+    while len(obs_deque) < obs_horizon:
+        obs_deque.appendleft(obs)
+    
     imgs = [env.render(mode='rgb_array')]
     rewards = []
     done = False
@@ -776,12 +1000,16 @@ def evaluate():
         print(f"Failed to load dataset for stats: {e}")
         return
 
+    print("Starting evaluation loop...")
     with tqdm(total=max_steps, desc="Evaluating") as pbar:
         while not done:
             # Stack observations
             obs_stack = []
             for obs_dict in obs_deque:
                 img = obs_dict['image']
+                # Normalize to [-1, 1] to match dataset normalization
+                if img.max() <= 1.0:  # If image is in [0,1] range, convert to [-1,1]
+                    img = img * 2.0 - 1.0
                 obs_stack.append(img)
             
             # Convert to torch tensor
@@ -792,22 +1020,24 @@ def evaluate():
             # Sample actions
             with torch.no_grad():
                 # Generate noise as starting point
+                B = 1
                 noisy_action = torch.randn(
-                    (1, pred_horizon, 2),  # [batch_size, sequence_length, action_dim]
+                    (B, pred_horizon, 2),  # [batch_size, sequence_length, action_dim]
                     device=device
                 )
                 
-                # Generate trajectory using the model
+                # Generate trajectory with more ODE steps for better sampling
                 ode_traj = flow_model.sample_ode_shortcut(
                     z0=noisy_action,
-                    obs=obs_tensor
+                    obs=obs_tensor,
+                    N=ode_steps  # Using more ODE steps
                 )
                 
                 # Get final prediction
                 naction = ode_traj[-1]  # Shape: [1, pred_horizon, 2]
 
             # Convert to numpy and unnormalize
-            naction_np = naction[0].cpu().numpy()  # Remove batch dimension
+            naction_np = naction.cpu().numpy()[0]  # Remove batch dimension
             action_pred = unnormalize_data(
                 naction_np,
                 dataset.stats['action']
@@ -817,30 +1047,52 @@ def evaluate():
             start = obs_horizon - 1
             end = start + action_horizon
             action_sequence = action_pred[start:end, :]  # Shape: [action_horizon, 2]
-
+            
+            # Debug prints
+            if step_idx % 50 == 0:
+                print(f"\nStep {step_idx}: Action sequence range: {action_sequence.min()} to {action_sequence.max()}")
+                agent_pos = None
+                block_pos = None
+                if 'pos_agent' in info:
+                    agent_pos = info['pos_agent']
+                    print(f"Agent position: {agent_pos}")
+                if 'block_pose' in info:
+                    block_pos = info['block_pose']
+                    print(f"Block position: {block_pos[:2]}, angle: {block_pos[2]}")
+            
             # Execute each action
             for i in range(len(action_sequence)):
                 action = action_sequence[i]
-                obs, reward, done, _, info = env.step(action)
+                # Use the proper environment step method
+                obs, reward, terminated, truncated, info = env.step(action)
+                
+                # Save observations and render info
                 obs_deque.append(obs)
                 rewards.append(reward)
                 imgs.append(env.render(mode='rgb_array'))
 
+                # Report non-zero rewards immediately
+                if reward > 0 and step_idx % 10 == 0:
+                    print(f"Step {step_idx}, Action {i}: Got positive reward: {reward}")
+
+                # Update progress
                 step_idx += 1
                 pbar.update(1)
                 pbar.set_postfix(reward=reward)
                 
-                if step_idx > max_steps:
-                    done = True
+                done = terminated or truncated or (step_idx >= max_steps)
                 if done:
                     break
 
-    print('Max reward:', max(rewards))
-    print('Average reward:', np.mean(rewards))
+    # Print results
+    print('Max reward:', max(rewards) if rewards else 0)
+    print('Average reward:', np.mean(rewards) if rewards else 0)
+    
+    # Save video
     try:
         from skvideo.io import vwrite
-        vwrite('vis.mp4', imgs)
-        print("Saved evaluation video to vis.mp4")
+        vwrite('vision_based_vis.mp4', imgs)
+        print("Saved evaluation video to vision_based_vis.mp4")
     except ImportError:
         print("scikit-video not available, video not saved")
     except Exception as e:
@@ -848,9 +1100,12 @@ def evaluate():
 
 if __name__ == "__main__":
     import os
-    if os.path.exists(os.path.join('checkpoints', 'best.pt')):
-        print("Found saved checkpoint, running evaluation...")
+    import sys
+    
+    # Check for command line arguments
+    if len(sys.argv) > 1 and sys.argv[1] == 'evaluate':
+        print("Running evaluation mode...")
         evaluate()
     else:
-        print("No checkpoint found, starting training...")
+        print("Running training mode...")
         main() 

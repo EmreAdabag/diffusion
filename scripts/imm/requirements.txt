@@ -1,0 +1,13 @@
+torch 
+torchvision 
+diffusers
+scikit-image 
+scikit-video 
+zarr 
+numcodecs 
+pygame 
+pymunk 
+gym 
+shapely 
+opencv-python 
+gdown

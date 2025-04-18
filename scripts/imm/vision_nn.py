@@ -424,7 +424,8 @@ class RoboIMM:
         sigma_data,
         obs_horizon,
         pred_horizon,
-        num_particles
+        num_particles,
+        seed=12345
     ):
         """
         Initialize the IMM sampler.
@@ -468,6 +469,13 @@ class RoboIMM:
         self.nets = nets
 
         self.loss = IMMloss(obs_horizon=obs_horizon, pred_horizon=pred_horizon, num_particles=num_particles)
+        
+        self._seed = seed
+        self.generator = torch.Generator(device=device)
+        self.reset()
+
+    def reset(self):
+        self.generator.manual_seed(self._seed)
 
     def get_alpha_sigma(self, t):
         """Get alpha and sigma values for time t."""
@@ -517,7 +525,7 @@ class RoboIMM:
         obs = torch.cat([image_features, agent_pos],dim=-1)
         # (1,2,514)
 
-        x = torch.randn(shape, device=device) * self.sigma_data
+        x = torch.randn(shape, device=device, generator=self.generator) * self.sigma_data
         
         # Define time steps (uniform steps from 1 to 0)
         times = torch.linspace(0.994, 0.006, steps + 1, device=device)

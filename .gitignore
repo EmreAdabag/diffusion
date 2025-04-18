@@ -1,9 +1,10 @@
-venv/
+*venv/
 __pycache__/
 *.pyc
 *.mp4
 *.mp3
 *.wav
+**.pth
 scripts/flow_match/checkpoints/*.pt
 scripts/flow_match/*.pt
 scripts/flow_match/*.zarr

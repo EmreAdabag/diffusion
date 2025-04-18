@@ -665,9 +665,7 @@ class RoboIMM:
                         optimizer.step()
                         lr_scheduler.step()
 
-                        if batch_idx % 10 == 0:
-                            print(f"Epoch {epoch_idx}, Batch {batch_idx}, Loss: {loss.item()}")
-                        if batch_idx == 0 and epoch_idx % 10 == 0:
+                        if batch_idx == 0 and epoch_idx % 5 == 0:
                             # save model checkpoint
                             torch.save({
                                 'epoch': epoch_idx,
@@ -675,6 +673,12 @@ class RoboIMM:
                                 'optimizer_state_dict': optimizer.state_dict(),
                                 'loss': loss.item()
                             }, f"ckpts/model_checkpoint_{epoch_idx}_{batch_idx}_{loss.item()}.pth")
+        torch.save({
+            'epoch': epoch_idx,
+            'model_state_dict': self.nets.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': loss.item()
+        }, f"ckpts/model_checkpoint_{epoch_idx}_{batch_idx}_{loss.item()}.pth")
     
     def load_model(self, path):
         state_dict = torch.load(path, map_location='cuda')

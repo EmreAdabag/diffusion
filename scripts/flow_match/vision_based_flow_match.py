@@ -23,6 +23,9 @@ import os
 from pusht_env import PushTImageEnv
 #from flow_matching_vision_based import VisionEncoder, ConditionalUnet1D, ShortcutModel
 import math
+from state_based_flow_match import ConditionalUnet1D as StateConditionalUnet1D
+# Override local UNet name so that ConditionalUnet1D always refers to the state-based U-Net
+ConditionalUnet1D = StateConditionalUnet1D
 
 # Check for different GPU backends
 if torch.cuda.is_available():
@@ -301,7 +304,7 @@ class VisionShortcutModel():
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         return checkpoint['epoch'], checkpoint['loss']
 
-    def get_train_tuple(self, z0=None, z1=None, obs=None):
+    def get_train_tuple(self, z0=None, z1=None, obs=None, agent_pos=None):
         """
         Get training tuple for flow matching.
         
@@ -309,6 +312,7 @@ class VisionShortcutModel():
             z0: Noise tensor of shape (batch_size, sequence_length, feature_dim)
             z1: Target action tensor of shape (batch_size, sequence_length, feature_dim)
             obs: Observation tensor of shape (batch_size, obs_horizon, height, width, channels)
+            agent_pos: Agent position tensor of shape (batch_size, 2)
             
         Returns:
             z_t: Noisy action at time t
@@ -324,6 +328,8 @@ class VisionShortcutModel():
             z1 = z1.to(self.device)
         if obs is not None and obs.device != self.device:
             obs = obs.to(self.device)
+        if agent_pos is not None and agent_pos.device != self.device:
+            agent_pos = agent_pos.to(self.device)
         
         B = z0.shape[0]
         distance = torch.zeros((B,), device=z0.device)
@@ -335,12 +341,16 @@ class VisionShortcutModel():
         # Target vector field is (z1 - z0)
         target = z1 - z0
         
-        # Encode observations
-        global_cond = self.vision_encoder(obs)
+        # Encode image observations and agent positions
+        image_feat = self.vision_encoder(obs)
+        if agent_pos is None:
+            raise ValueError('Must pass agent_pos for vision conditioning')
+        pos_flat = agent_pos.flatten(start_dim=1)
+        global_cond = torch.cat([image_feat, pos_flat], dim=1)
         
         return z_t, t, target, distance, global_cond
 
-    def get_shortcut_train_tuple(self, z0=None, z1=None, obs=None):
+    def get_shortcut_train_tuple(self, z0=None, z1=None, obs=None, agent_pos=None):
         """
         Get training tuple for shortcut flow matching.
         
@@ -348,6 +358,7 @@ class VisionShortcutModel():
             z0: Noise tensor of shape (batch_size, sequence_length, feature_dim)
             z1: Target action tensor of shape (batch_size, sequence_length, feature_dim)
             obs: Observation tensor of shape (batch_size, obs_horizon, height, width, channels)
+            agent_pos: Agent position tensor of shape (batch_size, 2)
             
         Returns:
             z_t: Noisy action at time t
@@ -369,8 +380,12 @@ class VisionShortcutModel():
         # Linear interpolation between z0 and z1 at time t
         z_t = t_view * z1 + (1 - t_view) * z0
         
-        # Encode observations
-        global_cond = self.vision_encoder(obs)
+        # Encode image observations and agent positions
+        image_feat = self.vision_encoder(obs)
+        if agent_pos is None:
+            raise ValueError('Must pass agent_pos for vision conditioning')
+        pos_flat = agent_pos.flatten(start_dim=1)
+        global_cond = torch.cat([image_feat, pos_flat], dim=1)
         
         # Step 1: Predict vector field at current state
         s_t = self.model(z_t, t, distance=distance, global_cond=global_cond)
@@ -389,13 +404,14 @@ class VisionShortcutModel():
         return z_t, t, target, distance * 2, global_cond
 
     @torch.no_grad()
-    def sample_ode_shortcut(self, z0=None, obs=None, N=None):
+    def sample_ode_shortcut(self, z0=None, obs=None, agent_pos=None, N=None):
         """
         Sample trajectory using shortcut ODE solver.
         
         Args:
             z0: Initial noise tensor of shape (batch_size, sequence_length, feature_dim)
             obs: Observation tensor of shape (batch_size, obs_horizon, height, width, channels)
+            agent_pos: Agent position tensor of shape (batch_size, 2)
             N: Number of steps to take (typically small, like 2, for evaluation)
             
         Returns:
@@ -415,8 +431,12 @@ class VisionShortcutModel():
         # Create a tensor for dt with the right shape and device
         dt_tensor = torch.ones((B,), device=self.device) * dt
         
-        # Encode observations - do this just once for efficiency
-        global_cond = self.vision_encoder(obs)
+        # Encode image observations and agent positions for conditioning
+        image_feat = self.vision_encoder(obs)
+        if agent_pos is None:
+            raise ValueError("Must pass agent_pos for vision conditioning")
+        pos_flat = agent_pos.flatten(start_dim=1)
+        global_cond = torch.cat([image_feat, pos_flat], dim=1)
         
         # Sample the ODE trajectory
         for i in range(N):
@@ -434,244 +454,12 @@ class VisionShortcutModel():
             
         return traj
 
-class ConditionalUnet1D(nn.Module):
-    def __init__(self,
-        input_dim,
-        global_cond_dim,
-        diffusion_step_embed_dim=256,
-        down_dims=[256,512,1024],
-        kernel_size=5,
-        n_groups=8
-        ):
-        """
-        input_dim: Dim of actions.
-        global_cond_dim: Dim of global conditioning applied with FiLM
-          in addition to diffusion step embedding. This is usually obs_horizon * obs_dim
-        diffusion_step_embed_dim: Size of positional encoding for diffusion iteration k
-        down_dims: Channel size for each UNet level.
-          The length of this array determines numebr of levels.
-        kernel_size: Conv kernel size
-        n_groups: Number of groups for GroupNorm
-        """
-
-        super().__init__()
-        
-        # Time embedding
-        self.time_embed = nn.Sequential(
-            SinusoidalPosEmb(diffusion_step_embed_dim),
-            nn.Linear(diffusion_step_embed_dim, diffusion_step_embed_dim * 4),
-            nn.Mish(),
-            nn.Linear(diffusion_step_embed_dim * 4, diffusion_step_embed_dim),
-        )
-        
-        # Distance embedding
-        self.dist_embed = nn.Sequential(
-            SinusoidalPosEmb(diffusion_step_embed_dim),
-            nn.Linear(diffusion_step_embed_dim, diffusion_step_embed_dim * 4),
-            nn.Mish(),
-            nn.Linear(diffusion_step_embed_dim * 4, diffusion_step_embed_dim),
-        )
-        
-        # Global conditioning projection
-        self.global_proj = nn.Sequential(
-            nn.Linear(global_cond_dim, diffusion_step_embed_dim * 4),
-            nn.Mish(),
-            nn.Linear(diffusion_step_embed_dim * 4, diffusion_step_embed_dim),
-        )
-        
-        # Input embedding
-        self.input_embed = nn.Sequential(
-            nn.Conv1d(input_dim, down_dims[0], kernel_size=kernel_size, padding=kernel_size//2),
-        )
-        
-        # MLP backbone
-        self.mlp = nn.Sequential(
-            nn.Linear(down_dims[0] + diffusion_step_embed_dim * 3, down_dims[0] * 2),
-            nn.Mish(),
-            nn.Linear(down_dims[0] * 2, down_dims[0] * 2),
-            nn.Mish(),
-            nn.Linear(down_dims[0] * 2, down_dims[0] * 2),
-            nn.Mish(),
-            nn.Linear(down_dims[0] * 2, down_dims[0]),
-            nn.Mish(),
-            nn.Linear(down_dims[0], input_dim),
-        )
-        
-        print("number of parameters: {:e}".format(
-            sum(p.numel() for p in self.parameters()))
-        )
-
-    def forward(self,
-            sample: torch.Tensor,
-            timestep: Union[torch.Tensor, float, int],
-            distance=None,
-            global_cond=None):
-        """
-        x: (B,T,input_dim)
-        timestep: (B,) or int, diffusion step
-        global_cond: (B,global_cond_dim)
-        output: (B,T,input_dim)
-        """
-        # (B,T,C)
-        sample_orig = sample
-        sample = sample.moveaxis(-1,-2)
-        # (B,C,T)
-
-        # 1. time
-        timesteps = timestep
-        if not torch.is_tensor(timesteps):
-            timesteps = torch.tensor([timesteps], dtype=torch.long, device=sample.device)
-        elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
-            timesteps = timesteps[None].to(sample.device)
-        # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-        timesteps = timesteps.expand(sample.shape[0])
-
-        if distance is None:
-            distance = torch.zeros_like(timesteps, device=sample.device)
-        else:
-            if not torch.is_tensor(distance):
-                distance = torch.tensor([distance], dtype=torch.long)
-            elif torch.is_tensor(distance) and len(distance.shape) == 0:
-                distance = distance[None]
-            # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-            distance = distance.expand(sample.shape[0]).to(sample.device)
-
-        # Time and distance embeddings
-        t_emb = self.time_embed(timesteps)  # (B, diffusion_step_embed_dim)
-        d_emb = self.dist_embed(distance)   # (B, diffusion_step_embed_dim)
-        
-        # Global conditioning
-        g_emb = self.global_proj(global_cond) if global_cond is not None else torch.zeros_like(t_emb)
-        
-        # Initial feature extraction from input
-        x = self.input_embed(sample)  # (B, down_dims[0], T)
-        
-        # Reshape for MLP processing
-        B, C, T = x.shape
-        x = x.permute(0, 2, 1)  # (B, T, C)
-        x = x.reshape(B * T, C)  # (B*T, C)
-        
-        # Expand condition embeddings for each timestep
-        t_emb = t_emb.unsqueeze(1).expand(-1, T, -1).reshape(B * T, -1)  # (B*T, diffusion_step_embed_dim)
-        d_emb = d_emb.unsqueeze(1).expand(-1, T, -1).reshape(B * T, -1)  # (B*T, diffusion_step_embed_dim)
-        g_emb = g_emb.unsqueeze(1).expand(-1, T, -1).reshape(B * T, -1)  # (B*T, diffusion_step_embed_dim)
-        
-        # Concatenate features and condition embeddings
-        x = torch.cat([x, t_emb, d_emb, g_emb], dim=1)  # (B*T, C + 3*diffusion_step_embed_dim)
-        
-        # Forward through MLP
-        x = self.mlp(x)  # (B*T, input_dim)
-        
-        # Reshape back to original dimensions
-        x = x.reshape(B, T, -1)  # (B, T, input_dim)
-        
-        return x
-
-class SinusoidalPosEmb(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.dim = dim
-
-    def forward(self, x):
-        device = x.device
-        half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = x[:, None] * emb[None, :]
-        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
-        return emb
-
-
-class Downsample1d(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.conv = nn.Conv1d(dim, dim, 3, 2, 1)
-
-    def forward(self, x):
-        return self.conv(x)
-
-class Upsample1d(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.conv = nn.ConvTranspose1d(dim, dim, 4, 2, 1)
-
-    def forward(self, x):
-        return self.conv(x)
-
-
-class Conv1dBlock(nn.Module):
-    '''
-        Conv1d --> GroupNorm --> Mish
-    '''
-
-    def __init__(self, inp_channels, out_channels, kernel_size, n_groups=8):
-        super().__init__()
-
-        self.block = nn.Sequential(
-            nn.Conv1d(inp_channels, out_channels, kernel_size, padding=kernel_size // 2),
-            nn.GroupNorm(n_groups, out_channels),
-            nn.Mish(),
-        )
-
-    def forward(self, x):
-        return self.block(x)
-
-
-class ConditionalResidualBlock1D(nn.Module):
-    def __init__(self,
-            in_channels,
-            out_channels,
-            cond_dim,
-            kernel_size=3,
-            n_groups=8):
-        super().__init__()
-
-        self.blocks = nn.ModuleList([
-            Conv1dBlock(in_channels, out_channels, kernel_size, n_groups=n_groups),
-            Conv1dBlock(out_channels, out_channels, kernel_size, n_groups=n_groups),
-        ])
-
-        # FiLM modulation https://arxiv.org/abs/1709.07871
-        # predicts per-channel scale and bias
-        cond_channels = out_channels * 2
-        self.out_channels = out_channels
-        self.cond_encoder = nn.Sequential(
-            nn.Mish(),
-            nn.Linear(cond_dim, cond_channels),
-            nn.Unflatten(-1, (-1, 1))
-        )
-
-        # make sure dimensions compatible
-        self.residual_conv = nn.Conv1d(in_channels, out_channels, 1) \
-            if in_channels != out_channels else nn.Identity()
-
-    def forward(self, x, cond):
-        '''
-            x : [ batch_size x in_channels x horizon ]
-            cond : [ batch_size x cond_dim]
-
-            returns:
-            out : [ batch_size x out_channels x horizon ]
-        '''
-        out = self.blocks[0](x)
-        embed = self.cond_encoder(cond)
-
-        embed = embed.reshape(
-            embed.shape[0], 2, self.out_channels, 1)
-        scale = embed[:,0,...]
-        bias = embed[:,1,...]
-        out = scale * out + bias
-
-        out = self.blocks[1](out)
-        out = out + self.residual_conv(x)
-        return out
-
 def main():
     # Parameters
     pred_horizon = 16
     obs_horizon = 2
     action_horizon = 8
-    num_epochs = 50
+    num_epochs = 50  # match state-based training duration
     batch_size = 256
     dataset_path = "pusht_cchi_v7_replay.zarr.zip"
     checkpoint_dir = 'checkpoints'
@@ -722,10 +510,8 @@ def main():
     ).to(device)
     vision_encoder.train()
 
-    # Calculate the global conditioning dimension
-    # When obs_horizon=2, and each image produces 512 features,
-    # the total flattened feature dim will be 512*2 = 1024
-    global_cond_dim = 512 * obs_horizon
+    # Global conditioning dims: image features (512) + agent positions (2) per timestep
+    global_cond_dim = 512 * obs_horizon + 2 * obs_horizon
     
     # Initialize the noise prediction network
     noise_pred_net = ConditionalUnet1D(
@@ -747,9 +533,11 @@ def main():
 
     # Create optimizer with parameters from both model and vision encoder
     optimizer = torch.optim.AdamW(
-        list(noise_pred_net.parameters()) + list(vision_encoder.parameters()),
-        lr=2e-4,
-        weight_decay=1e-1
+        [
+            {'params': noise_pred_net.parameters(), 'weight_decay': 1e-1},
+            {'params': vision_encoder.parameters(), 'weight_decay': 0}
+        ],
+        lr=1e-4
     )
 
     # Learning rate scheduler
@@ -785,8 +573,9 @@ def main():
                 with tqdm(dataloader, desc='Batch', leave=False) as tepoch:
                     for nbatch in tepoch:
                         # Move data to device
-                        nimage = nbatch['image'].to(device)  # Shape: (B, T, H, W, C)
-                        naction = nbatch['action'].to(device)  # Shape: (B, seq_len, 2)
+                        nimage = nbatch['image'].to(device)        # Shape: (B, T, H, W, C)
+                        nagent_pos = nbatch['agent_pos'].to(device)  # Shape: (B, T, 2)
+                        naction = nbatch['action'].to(device)      # Shape: (B, seq_len, 2)
                         
                         # First batch - print shapes for debugging
                         if epoch_idx == 0 and len(rf_epoch_loss) == 0:
@@ -803,7 +592,7 @@ def main():
 
                         # Regular flow matching step
                         z_t, t, target, distance, global_cond = flow_model.get_train_tuple(
-                            z0=noise, z1=naction, obs=nimage)
+                            z0=noise, z1=naction, obs=nimage, agent_pos=nagent_pos)
                             
                         # First batch - print shapes for debugging
                         if epoch_idx == 0 and len(rf_epoch_loss) == 0:
@@ -827,7 +616,7 @@ def main():
                         # Shortcut training step
                         noise_shortcut = torch.randn(naction.shape, device=device)
                         z_t, t, target, distance, global_cond = flow_model.get_shortcut_train_tuple(
-                            z0=noise_shortcut, z1=naction, obs=nimage)
+                            z0=noise_shortcut, z1=naction, obs=nimage, agent_pos=nagent_pos)
                         pred_shortcut = flow_model.model(
                             z_t, t, distance=distance,
                             global_cond=global_cond)
@@ -880,12 +669,6 @@ def main():
                     epoch_idx + 1, optimizer, scheduler, avg_loss,
                     os.path.join(checkpoint_dir, 'latest.pt')
                 )
-                
-                # Fine-tuning phase: reduce learning rate for last 10 epochs
-                if epoch_idx == num_epochs - 11:
-                    print("\nStarting fine-tuning phase with lower learning rate")
-                    for param_group in optimizer.param_groups:
-                        param_group['lr'] = 5e-5  # Much lower learning rate for fine-tuning
 
     except KeyboardInterrupt:
         print("\nTraining interrupted by user")
@@ -908,10 +691,8 @@ def evaluate():
     pred_horizon = 16
     ode_steps = 8  # Increased from 2 to 8 for better sampling
 
-    # Calculate the global conditioning dimension
-    # When obs_horizon=2, and each image produces 512 features,
-    # the total flattened feature dim will be 512*2 = 1024
-    global_cond_dim = 512 * obs_horizon
+    # Global conditioning dims: image features (512) + agent positions (2) per timestep
+    global_cond_dim = 512 * obs_horizon + 2 * obs_horizon
 
     # Load models
     vision_encoder = VisionEncoder(
@@ -1005,17 +786,29 @@ def evaluate():
         while not done:
             # Stack observations
             obs_stack = []
+            pos_stack = []
             for obs_dict in obs_deque:
                 img = obs_dict['image']
                 # Normalize to [-1, 1] to match dataset normalization
                 if img.max() <= 1.0:  # If image is in [0,1] range, convert to [-1,1]
                     img = img * 2.0 - 1.0
                 obs_stack.append(img)
+                pos_stack.append(obs_dict['agent_pos'])
             
-            # Convert to torch tensor
+            # Convert to torch tensor and add batch dimension
             obs_tensor = torch.from_numpy(np.stack(obs_stack)).float().to(device)
-            # Add batch dimension
             obs_tensor = obs_tensor.unsqueeze(0)  # Shape: [1, obs_horizon, H, W, C]
+            # Convert agent positions to tensor
+            pos_tensor = torch.from_numpy(np.stack(pos_stack)).float().to(device)
+            pos_tensor = pos_tensor.unsqueeze(0)  # Shape: [1, obs_horizon, 2]
+            # Normalize agent_pos to [-1, 1] using training stats
+            stats_min = torch.tensor(dataset.stats['agent_pos']['min'], device=device)  # shape [2]
+            stats_max = torch.tensor(dataset.stats['agent_pos']['max'], device=device)  # shape [2]
+            # Expand to match (1, obs_horizon, 2)
+            stats_min = stats_min.view(1, 1, -1)
+            stats_max = stats_max.view(1, 1, -1)
+            pos_tensor = (pos_tensor - stats_min) / (stats_max - stats_min)  # [0,1]
+            pos_tensor = pos_tensor * 2.0 - 1.0  # [-1,1]
 
             # Sample actions
             with torch.no_grad():
@@ -1030,6 +823,7 @@ def evaluate():
                 ode_traj = flow_model.sample_ode_shortcut(
                     z0=noisy_action,
                     obs=obs_tensor,
+                    agent_pos=pos_tensor,
                     N=ode_steps  # Using more ODE steps
                 )
                 
@@ -1087,6 +881,8 @@ def evaluate():
     # Print results
     print('Max reward:', max(rewards) if rewards else 0)
     print('Average reward:', np.mean(rewards) if rewards else 0)
+    # Report the final score (max reward) like in the state-based script
+    print('Score:', max(rewards) if rewards else 0)
     
     # Save video
     try:

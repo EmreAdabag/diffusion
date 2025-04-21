@@ -22,6 +22,9 @@ positive_y_is_up = False
 
 def to_pygame(p, surface):
     """Convert pymunk coordinates to pygame surface coordinates."""
+    # Guard against invalid (NaN/inf) positions
+    if not np.isfinite(p[0]) or not np.isfinite(p[1]):
+        return (0, 0)
     if positive_y_is_up:
         return round(p[0]), surface.get_height() - round(p[1])
     else:
@@ -40,9 +43,14 @@ class DrawOptions(pymunk.SpaceDebugDrawOptions):
         super(DrawOptions, self).__init__()
 
     def draw_circle(self, pos, angle, radius, outline_color, fill_color):
-        p = to_pygame(pos, self.surface)
-        pygame.draw.circle(self.surface, fill_color.as_int(), p, round(radius), 0)
-        pygame.draw.circle(self.surface, light_color(fill_color).as_int(), p, round(radius-4), 0)
+        try:
+            p = to_pygame(pos, self.surface)
+            r = int(round(radius)) if np.isfinite(radius) else 0
+            if r > 0:
+                pygame.draw.circle(self.surface, fill_color.as_int(), p, r, 0)
+                pygame.draw.circle(self.surface, light_color(fill_color).as_int(), p, max(0, r-4), 0)
+        except Exception:
+            pass
 
     def draw_segment(self, a, b, color):
         p1 = to_pygame(a, self.surface)
@@ -292,8 +300,11 @@ class PushTEnv(gym.Env):
             goal_points += [goal_points[0]]
             pygame.draw.polygon(canvas, self.goal_color, goal_points)
 
-        # Draw agent and block.
-        self.space.debug_draw(draw_options)
+        # Draw agent and block (ignore any draw errors)
+        try:
+            self.space.debug_draw(draw_options)
+        except Exception:
+            pass
 
         if mode == "human":
             # The following line copies our drawings from `canvas` to the visible window

@@ -449,7 +449,7 @@ def main():
     batch_size = 64
     dataset_path = "pusht_cchi_v7_replay.zarr.zip"
     checkpoint_dir = 'checkpoints'
-    checkpoint_freq = 5
+    checkpoint_freq = 10
     retrain = True  # Set to True to retrain from scratch
 
     # Create checkpoint directory
@@ -640,26 +640,20 @@ def main():
                     lr=optimizer.param_groups[0]['lr']
                 )
 
-                # Save checkpoint if best so far
-                if avg_loss < best_loss:
-                    best_loss = avg_loss
-                    flow_model.save_checkpoint(
-                        epoch_idx + 1, optimizer, scheduler, avg_loss,
-                        os.path.join(checkpoint_dir, 'best.pt')
-                    )
-
-                # Save periodic checkpoint
+                # Save periodic checkpoint only
                 if (epoch_idx + 1) % checkpoint_freq == 0:
                     flow_model.save_checkpoint(
                         epoch_idx + 1, optimizer, scheduler, avg_loss,
                         os.path.join(checkpoint_dir, f'epoch_{epoch_idx+1}.pt')
                     )
 
-                # Always save latest checkpoint
-                flow_model.save_checkpoint(
-                    epoch_idx + 1, optimizer, scheduler, avg_loss,
-                    os.path.join(checkpoint_dir, 'latest.pt')
-                )
+                # Optionally keep best.pt if you want to track best model
+                if avg_loss < best_loss:
+                    best_loss = avg_loss
+                    flow_model.save_checkpoint(
+                        epoch_idx + 1, optimizer, scheduler, avg_loss,
+                        os.path.join(checkpoint_dir, 'best.pt')
+                    )
 
     except KeyboardInterrupt:
         print("\nTraining interrupted by user")

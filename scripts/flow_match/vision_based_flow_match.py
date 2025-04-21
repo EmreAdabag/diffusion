@@ -7,9 +7,10 @@ from typing import Tuple, Sequence, Dict, Union, Optional
 import numpy as np
 import torch
 import torch.nn as nn
-import zarr
-from tqdm import tqdm
+import torchvision
 import collections
+import zarr
+from tqdm.auto import tqdm
 import gym
 from gym import spaces
 import pygame
@@ -23,9 +24,12 @@ import os
 from pusht_env import PushTImageEnv
 #from flow_matching_vision_based import VisionEncoder, ConditionalUnet1D, ShortcutModel
 import math
-from state_based_flow_match import ConditionalUnet1D as StateConditionalUnet1D
+from state_based_flow_match import (
+    ConditionalUnet1D, RectifiedFlow, ShortcutModel,
+    normalize_data, unnormalize_data
+)
 # Override local UNet name so that ConditionalUnet1D always refers to the state-based U-Net
-ConditionalUnet1D = StateConditionalUnet1D
+ConditionalUnet1D = ConditionalUnet1D
 
 # Check for different GPU backends
 if torch.cuda.is_available():
@@ -188,74 +192,51 @@ class VisionEncoder(nn.Module):
         super().__init__()
         self.obs_horizon = obs_horizon
         
-        # Enhanced CNN encoder with deeper architecture and residual connections
-        self.encoder = nn.Sequential(
-            # Input: (batch_size, channels, image_size, image_size)
-            nn.Conv2d(input_channels, 32, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 32),
-            nn.Mish(),
+        # Use ResNet18 backbone
+        resnet = torchvision.models.resnet18(weights=None)
+        
+        # First collect all BatchNorm layers to replace
+        bn_layers = []
+        for name, module in resnet.named_modules():
+            if isinstance(module, nn.BatchNorm2d):
+                bn_layers.append((name, module.num_features))
+        
+        # Then replace them with GroupNorm
+        for name, num_features in bn_layers:
+            # Get the parent module and attribute name
+            parent_name = '.'.join(name.split('.')[:-1])
+            attr_name = name.split('.')[-1]
             
-            # First residual block
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 64),
-            nn.Mish(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
-            nn.GroupNorm(8, 64),
-            nn.Mish(),
-            
-            # Second residual block
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 128),
-            nn.Mish(),
-            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1),
-            nn.GroupNorm(8, 128),
-            nn.Mish(),
-            
-            # Third residual block
-            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 256),
-            nn.Mish(),
-            nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1),
-            nn.GroupNorm(8, 256),
-            nn.Mish(),
-            
-            # Fourth residual block
-            nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 512),
-            nn.Mish(),
-            nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=1),
-            nn.GroupNorm(8, 512),
-            nn.Mish(),
-            
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(512, 512),
-            nn.Mish(),
-            nn.Linear(512, output_dim)
+            if parent_name:
+                parent = resnet.get_submodule(parent_name)
+                setattr(parent, attr_name, nn.GroupNorm(8, num_features))
+            else:
+                setattr(resnet, name, nn.GroupNorm(8, num_features))
+        
+        # Remove last few layers
+        resnet.layer4 = nn.Identity()  # Remove last ResNet block
+        resnet.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        resnet.fc = nn.Sequential(
+            nn.Linear(256, output_dim),
+            nn.Mish()
         )
+        
+        self.encoder = resnet
     
     def forward(self, x):
-        # x shape: (batch_size, obs_horizon, height, width, channels) or (batch_size, height, width, channels)
-        if x.dim() == 5:
-            B, T, H, W, C = x.shape
-            # Process each timestep independently
-            features = []
-            for t in range(T):
-                # Permute dimensions to (batch_size, channels, height, width)
-                x_t = x[:, t].permute(0, 3, 1, 2)
-                # Image should already be normalized consistently outside
-                feat = self.encoder(x_t)
-                features.append(feat)
-            # Stack features along time dimension
-            x = torch.stack(features, dim=1)
-            # Flatten time and feature dimensions
-            x = x.reshape(B, -1)
-        else:
-            # Single image case
-            # Permute dimensions to (batch_size, channels, height, width)
-            x = x.permute(0, 3, 1, 2)
-            # Image should already be normalized consistently outside
-            x = self.encoder(x)
+        # x shape: (batch_size, obs_horizon, height, width, channels)
+        B, T, H, W, C = x.shape
+        
+        # Process each timestep
+        features = []
+        for t in range(T):
+            x_t = x[:, t].permute(0, 3, 1, 2)  # [B, C, H, W]
+            feat = self.encoder(x_t)
+            features.append(feat)
+            
+        # Stack and flatten
+        x = torch.stack(features, dim=1)  # [B, T, output_dim]
+        x = x.reshape(B, -1)  # [B, T*output_dim]
         return x
 
 class VisionShortcutModel():
@@ -454,13 +435,18 @@ class VisionShortcutModel():
             
         return traj
 
+def compute_loss(noise_pred, noise):
+    mse_loss = nn.functional.mse_loss(noise_pred, noise)
+    l1_loss = nn.functional.l1_loss(noise_pred, noise)
+    return mse_loss + 0.1 * l1_loss  # Weighted combination
+
 def main():
     # Parameters
     pred_horizon = 16
     obs_horizon = 2
     action_horizon = 8
-    num_epochs = 50  # match state-based training duration
-    batch_size = 256
+    num_epochs = 100  # match state-based training duration
+    batch_size = 64
     dataset_path = "pusht_cchi_v7_replay.zarr.zip"
     checkpoint_dir = 'checkpoints'
     checkpoint_freq = 5
@@ -510,10 +496,14 @@ def main():
     ).to(device)
     vision_encoder.train()
 
-    # Global conditioning dims: image features (512) + agent positions (2) per timestep
-    global_cond_dim = 512 * obs_horizon + 2 * obs_horizon
-    
-    # Initialize the noise prediction network
+    # Vision encoder outputs 512-dim per timestep
+    vision_dim = 512
+    # Agent position is 2D
+    pos_dim = 2
+    # Total conditioning per timestep
+    global_cond_dim = (vision_dim + pos_dim) * obs_horizon
+
+    # Initialize noise prediction network
     noise_pred_net = ConditionalUnet1D(
         input_dim=2,  # action dimension
         global_cond_dim=global_cond_dim,
@@ -532,13 +522,10 @@ def main():
     )
 
     # Create optimizer with parameters from both model and vision encoder
-    optimizer = torch.optim.AdamW(
-        [
-            {'params': noise_pred_net.parameters(), 'weight_decay': 1e-1},
-            {'params': vision_encoder.parameters(), 'weight_decay': 0}
-        ],
-        lr=1e-4
-    )
+    optimizer = torch.optim.AdamW([
+        {'params': noise_pred_net.parameters(), 'lr': 1e-4},
+        {'params': vision_encoder.parameters(), 'lr': 5e-5}  # Lower LR for vision
+    ], weight_decay=1e-6)
 
     # Learning rate scheduler
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -610,7 +597,7 @@ def main():
                         if epoch_idx == 0 and len(rf_epoch_loss) == 0:
                             print(f"pred: {pred.shape}")
                             
-                        loss = nn.functional.mse_loss(pred, target)
+                        loss = compute_loss(pred, noise)
                         loss.backward()
 
                         # Shortcut training step
@@ -620,12 +607,16 @@ def main():
                         pred_shortcut = flow_model.model(
                             z_t, t, distance=distance,
                             global_cond=global_cond)
-                        loss_shortcut = nn.functional.mse_loss(pred_shortcut, target)
+                        loss_shortcut = compute_loss(pred_shortcut, noise_shortcut)
                         loss_shortcut.backward()
 
                         # Optimize
                         optimizer.step()
                         optimizer.zero_grad()
+
+                        # Add gradient clipping
+                        torch.nn.utils.clip_grad_norm_(noise_pred_net.parameters(), 1.0)
+                        torch.nn.utils.clip_grad_norm_(vision_encoder.parameters(), 0.5)
 
                         # Logging
                         rf_loss_cpu = loss.item()

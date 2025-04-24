@@ -26,10 +26,8 @@ from pusht_env import PushTImageEnv
 import math
 from state_based_flow_match import (
     ConditionalUnet1D, RectifiedFlow, ShortcutModel,
-    normalize_data, unnormalize_data
+    normalize_data, unnormalize_data, get_data_stats
 )
-# Override local UNet name so that ConditionalUnet1D always refers to the state-based U-Net
-ConditionalUnet1D = ConditionalUnet1D
 
 # Check for different GPU backends
 if torch.cuda.is_available():
@@ -187,6 +185,72 @@ def unnormalize_data(ndata, stats):
     data = ndata * (stats['max'] - stats['min']) + stats['min']
     return data
 
+def get_resnet(name:str, weights=None, **kwargs) -> nn.Module:
+    """
+    name: resnet18, resnet34, resnet50
+    weights: "IMAGENET1K_V1", None
+    """
+    # Use standard ResNet implementation from torchvision
+    func = getattr(torchvision.models, name)
+    resnet = func(weights=weights, **kwargs)
+
+    # remove the final fully connected layer
+    # for resnet18, the output dim should be 512
+    resnet.fc = torch.nn.Identity()
+    return resnet
+
+def replace_submodules(
+        root_module: nn.Module,
+        predicate: callable,
+        func: callable) -> nn.Module:
+    """
+    Replace all submodules selected by the predicate with
+    the output of func.
+
+    predicate: Return true if the module is to be replaced.
+    func: Return new module to use.
+    """
+    if predicate(root_module):
+        return func(root_module)
+
+    bn_list = [k.split('.') for k, m
+        in root_module.named_modules(remove_duplicate=True)
+        if predicate(m)]
+    for *parent, k in bn_list:
+        parent_module = root_module
+        if len(parent) > 0:
+            parent_module = root_module.get_submodule('.'.join(parent))
+        if isinstance(parent_module, nn.Sequential):
+            src_module = parent_module[int(k)]
+        else:
+            src_module = getattr(parent_module, k)
+        tgt_module = func(src_module)
+        if isinstance(parent_module, nn.Sequential):
+            parent_module[int(k)] = tgt_module
+        else:
+            setattr(parent_module, k, tgt_module)
+    # verify that all modules are replaced
+    bn_list = [k.split('.') for k, m
+        in root_module.named_modules(remove_duplicate=True)
+        if predicate(m)]
+    assert len(bn_list) == 0
+    return root_module
+
+def replace_bn_with_gn(
+    root_module: nn.Module,
+    features_per_group: int=16) -> nn.Module:
+    """
+    Replace all BatchNorm layers with GroupNorm.
+    """
+    replace_submodules(
+        root_module=root_module,
+        predicate=lambda x: isinstance(x, nn.BatchNorm2d),
+        func=lambda x: nn.GroupNorm(
+            num_groups=x.num_features//features_per_group,
+            num_channels=x.num_features)
+    )
+    return root_module
+
 class VisionEncoder(nn.Module):
     def __init__(self, input_channels=3, output_dim=512, obs_horizon=2):
         super().__init__()
@@ -195,23 +259,8 @@ class VisionEncoder(nn.Module):
         # Use ResNet18 backbone
         resnet = torchvision.models.resnet18(weights=None)
         
-        # First collect all BatchNorm layers to replace
-        bn_layers = []
-        for name, module in resnet.named_modules():
-            if isinstance(module, nn.BatchNorm2d):
-                bn_layers.append((name, module.num_features))
-        
-        # Then replace them with GroupNorm
-        for name, num_features in bn_layers:
-            # Get the parent module and attribute name
-            parent_name = '.'.join(name.split('.')[:-1])
-            attr_name = name.split('.')[-1]
-            
-            if parent_name:
-                parent = resnet.get_submodule(parent_name)
-                setattr(parent, attr_name, nn.GroupNorm(8, num_features))
-            else:
-                setattr(resnet, name, nn.GroupNorm(8, num_features))
+        # Replace BatchNorm with GroupNorm for better few-shot performance
+        replace_bn_with_gn(resnet)
         
         # Remove last few layers
         resnet.layer4 = nn.Identity()  # Remove last ResNet block
@@ -421,8 +470,8 @@ class VisionShortcutModel():
         
         # Sample the ODE trajectory
         for i in range(N):
-            # Current time in [0,1]
-            t = torch.ones((B,), device=self.device) * i / N
+            # Current time in [0,1], properly scaled
+            t = torch.ones((B,), device=self.device) * (i * dt)
             
             # Predict the vector field at the current state
             pred = self.model(z, t, distance=dt_tensor, global_cond=global_cond)
@@ -441,16 +490,16 @@ def compute_loss(noise_pred, noise):
     return mse_loss + 0.1 * l1_loss  # Weighted combination
 
 def main():
-    # Parameters
+    # Parameters - match state-based exactly
     pred_horizon = 16
     obs_horizon = 2
     action_horizon = 8
-    num_epochs = 100  # match state-based training duration
+    num_epochs = 100
     batch_size = 64
     dataset_path = "pusht_cchi_v7_replay.zarr.zip"
     checkpoint_dir = 'checkpoints'
     checkpoint_freq = 10
-    retrain = True  # Set to True to retrain from scratch
+    retrain = True
 
     # Create checkpoint directory
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -503,28 +552,23 @@ def main():
     # Total conditioning per timestep
     global_cond_dim = (vision_dim + pos_dim) * obs_horizon
 
-    # Initialize noise prediction network
+    # Initialize noise prediction network - match state-based exactly
     noise_pred_net = ConditionalUnet1D(
         input_dim=2,  # action dimension
         global_cond_dim=global_cond_dim,
+        diffusion_step_embed_dim=256,
         down_dims=[256, 512, 1024],
         kernel_size=5,
         n_groups=8
     ).to(device)
     noise_pred_net.train()
 
-    # Create flow matching model with vision encoder
-    flow_model = VisionShortcutModel(
-        model=noise_pred_net,
-        vision_encoder=vision_encoder,
-        num_steps=100,
-        device=device
-    )
+    print(f"Total parameters: {sum(p.numel() for p in noise_pred_net.parameters()) + sum(p.numel() for p in vision_encoder.parameters())}")
 
     # Create optimizer with parameters from both model and vision encoder
     optimizer = torch.optim.AdamW([
         {'params': noise_pred_net.parameters(), 'lr': 1e-4},
-        {'params': vision_encoder.parameters(), 'lr': 5e-5}  # Lower LR for vision
+        {'params': vision_encoder.parameters(), 'lr': 5e-5}
     ], weight_decay=1e-6)
 
     # Learning rate scheduler
@@ -541,117 +585,125 @@ def main():
     if not retrain and os.path.exists(checkpoint_path):
         print(f"Found checkpoint at {checkpoint_path}")
         try:
-            start_epoch, best_loss = flow_model.load_checkpoint(
-                checkpoint_path, optimizer, scheduler)
+            # First try with weights_only=False (safer for our use case)
+            checkpoint = torch.load(checkpoint_path, weights_only=False, map_location=device)
+            noise_pred_net.load_state_dict(checkpoint['model_state_dict'])
+            vision_encoder.load_state_dict(checkpoint['vision_encoder_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            start_epoch = checkpoint['epoch']
+            best_loss = checkpoint['loss']
             print(f"Resumed from epoch {start_epoch} with loss {best_loss}")
         except Exception as e:
-            print(f"Failed to load checkpoint: {e}. Starting from scratch.")
-            start_epoch = 0
-            best_loss = float('inf')
+            print(f"Failed to load checkpoint with weights_only=False. Trying alternative method...")
+            try:
+                # If that fails, try with map_location and no weights_only
+                checkpoint = torch.load(checkpoint_path, map_location=device)
+                noise_pred_net.load_state_dict(checkpoint['model_state_dict'])
+                vision_encoder.load_state_dict(checkpoint['vision_encoder_state_dict'])
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                start_epoch = checkpoint['epoch']
+                best_loss = checkpoint['loss']
+                print(f"Resumed from epoch {start_epoch} with loss {best_loss}")
+            except Exception as e:
+                print(f"All loading attempts failed: {e}. Starting from scratch.")
+                start_epoch = 0
+                best_loss = float('inf')
 
     # Training loop
     try:
-        avg_loss = float('inf')  # Initialize avg_loss
+        avg_loss = float('inf')
         with tqdm(range(start_epoch, num_epochs), desc='Epoch') as tglobal:
             for epoch_idx in tglobal:
-                rf_epoch_loss = []
-                sc_epoch_loss = []
+                epoch_losses = []
 
                 with tqdm(dataloader, desc='Batch', leave=False) as tepoch:
                     for nbatch in tepoch:
                         # Move data to device
-                        nimage = nbatch['image'].to(device)        # Shape: (B, T, H, W, C)
-                        nagent_pos = nbatch['agent_pos'].to(device)  # Shape: (B, T, 2)
-                        naction = nbatch['action'].to(device)      # Shape: (B, seq_len, 2)
-                        
-                        # First batch - print shapes for debugging
-                        if epoch_idx == 0 and len(rf_epoch_loss) == 0:
-                            print("\nFirst batch shapes:")
-                            print(f"nimage: {nimage.shape}")
-                            print(f"naction: {naction.shape}")
-                            print(f"global_cond_dim: {global_cond_dim}")
+                        nimage = nbatch['image'].to(device)
+                        nagent_pos = nbatch['agent_pos'].to(device)
+                        naction = nbatch['action'].to(device)
                         
                         B = nimage.shape[0]
-                        pred_horizon_len = naction.shape[1]
 
-                        # Sample noise
-                        noise = torch.randn(naction.shape, device=device)
+                        # Get vision features and combine with agent positions
+                        vision_features = vision_encoder(nimage)
+                        global_cond = torch.cat([
+                            vision_features.flatten(1),
+                            nagent_pos.flatten(1)
+                        ], dim=1)
 
-                        # Regular flow matching step
-                        z_t, t, target, distance, global_cond = flow_model.get_train_tuple(
-                            z0=noise, z1=naction, obs=nimage, agent_pos=nagent_pos)
-                            
-                        # First batch - print shapes for debugging
-                        if epoch_idx == 0 and len(rf_epoch_loss) == 0:
-                            print(f"z_t: {z_t.shape}")
-                            print(f"t: {t.shape}")
-                            print(f"target: {target.shape}")
-                            print(f"distance: {distance.shape}")
-                            print(f"global_cond: {global_cond.shape}")
-                            
-                        pred = flow_model.model(
-                        z_t, t, distance=distance,
-                        global_cond=global_cond)
-                            
-                        # First batch - print shapes for debugging
-                        if epoch_idx == 0 and len(rf_epoch_loss) == 0:
-                            print(f"pred: {pred.shape}")
-                            
-                        loss = compute_loss(pred, noise)
+                        # Flow matching training - match state-based exactly
+                        # Sample random time steps
+                        t = torch.rand(B, device=device)
+                        # Sample noise and interpolate
+                        z0 = torch.randn_like(naction)
+                        z1 = naction
+                        # Linear interpolation between noise and target
+                        zt = t.view(-1, 1, 1) * z1 + (1 - t.view(-1, 1, 1)) * z0
+                        
+                        # Predict velocity field
+                        pred_v = noise_pred_net(zt, t, global_cond=global_cond)
+                        # Target velocity is constant throughout trajectory
+                        target_v = z1 - z0  # Constant target, independent of t
+                        
+                        # Flow matching loss with L1 regularization
+                        mse_loss = nn.functional.mse_loss(pred_v, target_v)
+                        l1_loss = nn.functional.l1_loss(pred_v, target_v)
+                        loss = mse_loss + 0.1 * l1_loss  # Same loss weighting as state-based
+
                         loss.backward()
 
-                        # Shortcut training step
-                        noise_shortcut = torch.randn(naction.shape, device=device)
-                        z_t, t, target, distance, global_cond = flow_model.get_shortcut_train_tuple(
-                            z0=noise_shortcut, z1=naction, obs=nimage, agent_pos=nagent_pos)
-                        pred_shortcut = flow_model.model(
-                            z_t, t, distance=distance,
-                            global_cond=global_cond)
-                        loss_shortcut = compute_loss(pred_shortcut, noise_shortcut)
-                        loss_shortcut.backward()
-
-                        # Optimize
-                        optimizer.step()
-                        optimizer.zero_grad()
-
-                        # Add gradient clipping
+                        # Gradient clipping - match state-based
                         torch.nn.utils.clip_grad_norm_(noise_pred_net.parameters(), 1.0)
                         torch.nn.utils.clip_grad_norm_(vision_encoder.parameters(), 0.5)
 
+                        optimizer.step()
+                        optimizer.zero_grad()
+
                         # Logging
-                        rf_loss_cpu = loss.item()
-                        sc_loss_cpu = loss_shortcut.item()
-                        rf_epoch_loss.append(rf_loss_cpu)
-                        sc_epoch_loss.append(sc_loss_cpu)
-                        tepoch.set_postfix(
-                            rf_loss=rf_loss_cpu,
-                            sc_loss=sc_loss_cpu
-                        )
+                        loss_cpu = loss.item()
+                        epoch_losses.append(loss_cpu)
+                        tepoch.set_postfix(loss=loss_cpu)
 
                 # Step scheduler
                 scheduler.step()
 
                 # Calculate average loss
-                avg_loss = np.mean(rf_epoch_loss) + np.mean(sc_epoch_loss)
+                avg_loss = np.mean(epoch_losses)
 
                 tglobal.set_postfix(
-                    rf_loss=np.mean(rf_epoch_loss),
-                    sc_loss=np.mean(sc_epoch_loss),
+                    loss=avg_loss,
                     lr=optimizer.param_groups[0]['lr']
                 )
 
-                # Save periodic checkpoint only
+                # Save periodic checkpoint
                 if (epoch_idx + 1) % checkpoint_freq == 0:
-                    flow_model.save_checkpoint(
-                        epoch_idx + 1, optimizer, scheduler, avg_loss,
+                    checkpoint = {
+                        'epoch': epoch_idx + 1,
+                        'model_state_dict': noise_pred_net.state_dict(),
+                        'vision_encoder_state_dict': vision_encoder.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
+                        'loss': avg_loss
+                    }
+                    torch.save(checkpoint,
                         os.path.join(checkpoint_dir, f'epoch_{epoch_idx+1}.pt')
                     )
 
-                # Optionally keep best.pt if you want to track best model
+                # Save best model
                 if avg_loss < best_loss:
                     best_loss = avg_loss
-                    flow_model.save_checkpoint(
-                        epoch_idx + 1, optimizer, scheduler, avg_loss,
+                    checkpoint = {
+                        'epoch': epoch_idx + 1,
+                        'model_state_dict': noise_pred_net.state_dict(),
+                        'vision_encoder_state_dict': vision_encoder.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
+                        'loss': avg_loss
+                    }
+                    torch.save(checkpoint,
                         os.path.join(checkpoint_dir, 'best.pt')
                     )
 
@@ -659,12 +711,19 @@ def main():
         print("\nTraining interrupted by user")
     except Exception as e:
         print(f"\nError during training: {str(e)}")
-        raise  # Re-raise the exception to see the full traceback
+        raise
     finally:
         if 'epoch_idx' in locals() and 'avg_loss' in locals():
-            # Save final model only if we have completed at least one epoch
-            flow_model.save_checkpoint(
-                epoch_idx + 1, optimizer, scheduler, avg_loss,
+            # Save final model
+            checkpoint = {
+                'epoch': epoch_idx + 1,
+                'model_state_dict': noise_pred_net.state_dict(),
+                'vision_encoder_state_dict': vision_encoder.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'loss': avg_loss
+            }
+            torch.save(checkpoint,
                 os.path.join(checkpoint_dir, 'final.pt')
             )
 
@@ -674,12 +733,12 @@ def evaluate():
     obs_horizon = 2
     action_horizon = 8
     pred_horizon = 16
-    ode_steps = 8  # Increased from 2 to 8 for better sampling
+    ode_steps = 8  # Number of integration steps
 
     # Global conditioning dims: image features (512) + agent positions (2) per timestep
     global_cond_dim = 512 * obs_horizon + 2 * obs_horizon
 
-    # Load models
+    # Load models - match state-based exactly
     vision_encoder = VisionEncoder(
         input_channels=3,
         output_dim=512,
@@ -689,18 +748,13 @@ def evaluate():
     noise_pred_net = ConditionalUnet1D(
         input_dim=2,
         global_cond_dim=global_cond_dim,
+        diffusion_step_embed_dim=256,
         down_dims=[256, 512, 1024],
         kernel_size=5,
         n_groups=8
     ).to(device)
 
-    # Create flow model
-    flow_model = VisionShortcutModel(
-        model=noise_pred_net,
-        vision_encoder=vision_encoder,
-        num_steps=100,
-        device=device
-    )
+    print(f"Total parameters: {sum(p.numel() for p in noise_pred_net.parameters()) + sum(p.numel() for p in vision_encoder.parameters())}")
 
     # Try to load the best checkpoint
     checkpoint_path = os.path.join('checkpoints', 'best.pt')
@@ -712,29 +766,28 @@ def evaluate():
 
     print(f"Loading checkpoint from {checkpoint_path}")
     try:
-        # Try loading with both options
-        try:
-            checkpoint = torch.load(checkpoint_path, weights_only=True)
-            print("Successfully loaded checkpoint with weights_only=True")
-        except Exception as e:
-            print(f"Warning: Could not load checkpoint with weights_only=True. Attempting with weights_only=False.")
-            checkpoint = torch.load(checkpoint_path, weights_only=False)
-            print("Successfully loaded checkpoint with weights_only=False")
-            
-        # Manual loading of the model and vision encoder
-        flow_model.model.load_state_dict(checkpoint['model_state_dict'])
-        if flow_model.vision_encoder is not None and checkpoint['vision_encoder_state_dict'] is not None:
-            flow_model.vision_encoder.load_state_dict(checkpoint['vision_encoder_state_dict'])
+        # First try with weights_only=False (safer for our use case)
+        checkpoint = torch.load(checkpoint_path, weights_only=False, map_location=device)
+        noise_pred_net.load_state_dict(checkpoint['model_state_dict'])
+        vision_encoder.load_state_dict(checkpoint['vision_encoder_state_dict'])
     except Exception as e:
         print(f"Error loading checkpoint: {e}")
-        return
+        print("Trying alternative loading method...")
+        try:
+            # If that fails, try with map_location and no weights_only
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            noise_pred_net.load_state_dict(checkpoint['model_state_dict'])
+            vision_encoder.load_state_dict(checkpoint['vision_encoder_state_dict'])
+        except Exception as e:
+            print(f"All loading attempts failed: {e}")
+            return
 
     # Set to evaluation mode
-    flow_model.model.eval()
-    flow_model.vision_encoder.eval()
+    noise_pred_net.eval()
+    vision_encoder.eval()
 
     # Try different seeds for evaluation
-    eval_seed = 200000  # Changed from 100000 to try a different seed
+    eval_seed = 200000
     env = PushTImageEnv()
     env.seed(eval_seed)
     print(f"Evaluating with seed: {eval_seed}")
@@ -774,8 +827,8 @@ def evaluate():
             pos_stack = []
             for obs_dict in obs_deque:
                 img = obs_dict['image']
-                # Normalize to [-1, 1] to match dataset normalization
-                if img.max() <= 1.0:  # If image is in [0,1] range, convert to [-1,1]
+                # Normalize to [-1, 1]
+                if img.max() <= 1.0:
                     img = img * 2.0 - 1.0
                 obs_stack.append(img)
                 pos_stack.append(obs_dict['agent_pos'])
@@ -783,90 +836,76 @@ def evaluate():
             # Convert to torch tensor and add batch dimension
             obs_tensor = torch.from_numpy(np.stack(obs_stack)).float().to(device)
             obs_tensor = obs_tensor.unsqueeze(0)  # Shape: [1, obs_horizon, H, W, C]
-            # Convert agent positions to tensor
             pos_tensor = torch.from_numpy(np.stack(pos_stack)).float().to(device)
             pos_tensor = pos_tensor.unsqueeze(0)  # Shape: [1, obs_horizon, 2]
-            # Normalize agent_pos to [-1, 1] using training stats
-            stats_min = torch.tensor(dataset.stats['agent_pos']['min'], device=device)  # shape [2]
-            stats_max = torch.tensor(dataset.stats['agent_pos']['max'], device=device)  # shape [2]
-            # Expand to match (1, obs_horizon, 2)
+            
+            # Normalize agent_pos to [-1, 1]
+            stats_min = torch.tensor(dataset.stats['agent_pos']['min'], device=device)
+            stats_max = torch.tensor(dataset.stats['agent_pos']['max'], device=device)
             stats_min = stats_min.view(1, 1, -1)
             stats_max = stats_max.view(1, 1, -1)
-            pos_tensor = (pos_tensor - stats_min) / (stats_max - stats_min)  # [0,1]
-            pos_tensor = pos_tensor * 2.0 - 1.0  # [-1,1]
+            pos_tensor = (pos_tensor - stats_min) / (stats_max - stats_min)
+            pos_tensor = pos_tensor * 2.0 - 1.0
 
-            # Sample actions
+            # Sample actions using flow matching - match state-based exactly
             with torch.no_grad():
-                # Generate noise as starting point
-                B = 1
-                noisy_action = torch.randn(
-                    (B, pred_horizon, 2),  # [batch_size, sequence_length, action_dim]
-                    device=device
-                )
+                # Get vision features and combine with agent positions
+                vision_features = vision_encoder(obs_tensor)
+                global_cond = torch.cat([
+                    vision_features.flatten(1),
+                    pos_tensor.flatten(1)
+                ], dim=1)
                 
-                # Generate trajectory with more ODE steps for better sampling
-                ode_traj = flow_model.sample_ode_shortcut(
-                    z0=noisy_action,
-                    obs=obs_tensor,
-                    agent_pos=pos_tensor,
-                    N=ode_steps  # Using more ODE steps
-                )
+                # Initial noise
+                z0 = torch.randn((1, pred_horizon, 2), device=device)
+                zt = z0
                 
-                # Get final prediction
-                naction = ode_traj[-1]  # Shape: [1, pred_horizon, 2]
+                # Euler integration with fixed target
+                dt = 1.0 / ode_steps
+                for i in range(ode_steps):
+                    t = torch.ones(1, device=device) * i * dt
+                    v = noise_pred_net(zt, t, global_cond=global_cond)
+                    zt = zt + v * dt
+                
+                # Take action after obs_horizon (same as state-based)
+                naction = zt[0, obs_horizon]  # Shape: [2]
 
             # Convert to numpy and unnormalize
-            naction_np = naction.cpu().numpy()[0]  # Remove batch dimension
-            action_pred = unnormalize_data(
-                naction_np,
+            action = unnormalize_data(
+                naction.cpu().numpy(),
                 dataset.stats['action']
             )
-
-            # Select actions to execute
-            start = obs_horizon - 1
-            end = start + action_horizon
-            action_sequence = action_pred[start:end, :]  # Shape: [action_horizon, 2]
             
             # Debug prints
             if step_idx % 50 == 0:
-                print(f"\nStep {step_idx}: Action sequence range: {action_sequence.min()} to {action_sequence.max()}")
-                agent_pos = None
-                block_pos = None
+                print(f"\nStep {step_idx}: Action range: {action.min()} to {action.max()}")
                 if 'pos_agent' in info:
-                    agent_pos = info['pos_agent']
-                    print(f"Agent position: {agent_pos}")
+                    print(f"Agent position: {info['pos_agent']}")
                 if 'block_pose' in info:
-                    block_pos = info['block_pose']
-                    print(f"Block position: {block_pos[:2]}, angle: {block_pos[2]}")
+                    print(f"Block position: {info['block_pose'][:2]}, angle: {info['block_pose'][2]}")
             
-            # Execute each action
-            for i in range(len(action_sequence)):
-                action = action_sequence[i]
-                # Use the proper environment step method
-                obs, reward, terminated, truncated, info = env.step(action)
-                
-                # Save observations and render info
-                obs_deque.append(obs)
-                rewards.append(reward)
-                imgs.append(env.render(mode='rgb_array'))
+            # Execute action
+            obs, reward, terminated, truncated, info = env.step(action)
+            
+            # Save observations and render info
+            obs_deque.append(obs)
+            rewards.append(reward)
+            imgs.append(env.render(mode='rgb_array'))
 
-                # Report non-zero rewards immediately
-                if reward > 0 and step_idx % 10 == 0:
-                    print(f"Step {step_idx}, Action {i}: Got positive reward: {reward}")
+            # Report non-zero rewards immediately
+            if reward > 0 and step_idx % 10 == 0:
+                print(f"Step {step_idx}: Got positive reward: {reward}")
 
-                # Update progress
-                step_idx += 1
-                pbar.update(1)
-                pbar.set_postfix(reward=reward)
-                
-                done = terminated or truncated or (step_idx >= max_steps)
-                if done:
-                    break
+            # Update progress
+            step_idx += 1
+            pbar.update(1)
+            pbar.set_postfix(reward=reward)
+            
+            done = terminated or truncated or (step_idx >= max_steps)
 
     # Print results
     print('Max reward:', max(rewards) if rewards else 0)
     print('Average reward:', np.mean(rewards) if rewards else 0)
-    # Report the final score (max reward) like in the state-based script
     print('Score:', max(rewards) if rewards else 0)
     
     # Save video

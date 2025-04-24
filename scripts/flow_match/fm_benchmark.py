@@ -30,11 +30,14 @@ import time
 # from imm.vision_nn import RoboIMM as ImmVision
 import pickle
 
-# Import the correct models
+# Import the correct models and functions
 from vision_based_flow_match import (
     VisionEncoder, 
     ConditionalUnet1D,
-    VisionShortcutModel
+    VisionShortcutModel,
+    normalize_data,
+    unnormalize_data,
+    PushTImageDataset
 )
 
 # Check for different GPU backends
@@ -666,8 +669,11 @@ class PushTImageEnv(PushTEnv):
 
         return self.render_cache
 
-def benchmark(model, diffusion_steps=1, mode='state'):
+def benchmark(model, diffusion_steps=1, mode='state', dataset=None, pred_horizon=16):
     device = torch.device('cuda')
+    
+    if dataset is None:
+        raise ValueError("Dataset must be provided for normalization stats")
 
     # limit environment interaction to 350 steps before termination
     max_steps = 350
@@ -706,30 +712,39 @@ def benchmark(model, diffusion_steps=1, mode='state'):
         
             while not done:
                 if mode == 'vision':
-                    # Get images and reshape to [B,T,H,W,C] for the vision encoder
-                    images = np.stack([x['image'] for x in obs_deque])  # [T,C,H,W]
-                    # Move channels to last axis
-                    images = np.moveaxis(images, 1, -1)  # [T,H,W,C]
-                    images = torch.from_numpy(images).float().unsqueeze(0).to(device)  # [1,T,H,W,C]
-
-                    # Normalize images to [-1,1] 
-                    images = images * 2.0 - 1.0
+                    # Stack observations
+                    obs_stack = []
+                    pos_stack = []
+                    for obs_dict in obs_deque:
+                        img = obs_dict['image']  # This is already [C, H, W] format
+                        # Normalize to [-1, 1] to match dataset normalization
+                        if img.max() <= 1.0:  # If image is in [0,1] range, convert to [-1,1]
+                            img = img * 2.0 - 1.0
+                        obs_stack.append(img)
+                        pos_stack.append(obs_dict['agent_pos'])
                     
-                    # Normalize agent positions to [-1,1]
-                    agent_poses = np.stack([x['agent_pos'] for x in obs_deque])
-                    nagent_poses = agent_poses / 256.0 - 1.0
-                    nagent_poses = torch.from_numpy(nagent_poses).unsqueeze(0).to(device, dtype=torch.float32)
+                    # Convert to torch tensor and add batch dimension
+                    obs_tensor = torch.from_numpy(np.stack(obs_stack)).float().to(device)
+                    # Reshape to [B, T, H, W, C] format expected by vision encoder
+                    obs_tensor = obs_tensor.permute(0, 2, 3, 1)  # [T, H, W, C]
+                    obs_tensor = obs_tensor.unsqueeze(0)  # [B, T, H, W, C]
+                    
+                    # Convert agent positions to tensor and normalize using dataset stats
+                    pos_stack = np.stack(pos_stack)
+                    pos_tensor = normalize_data(pos_stack, dataset.stats['agent_pos'])
+                    pos_tensor = torch.from_numpy(pos_tensor).float().to(device)
+                    pos_tensor = pos_tensor.unsqueeze(0)  # Shape: [1, obs_horizon, 2]
 
-                    # Generate initial noise
-                    z0 = torch.randn((1, 16, 2), device=device)
+                    # Generate initial noise using pred_horizon
+                    z0 = torch.randn((1, pred_horizon, 2), device=device)
 
                     # Sample trajectory
                     with torch.no_grad():
                         start_time = time.time()
                         traj = model.sample_ode_shortcut(
                             z0=z0,
-                            obs=images,
-                            agent_pos=nagent_poses,
+                            obs=obs_tensor,
+                            agent_pos=pos_tensor,
                             N=diffusion_steps
                         )
                         end_time = time.time()
@@ -763,61 +778,93 @@ def benchmark(model, diffusion_steps=1, mode='state'):
     print(f'Final reward: {sum(final_rewards)/episodes}')
     return final_rewards, starts, ends
 
+def save_results(epoch, rewards_dict, filename='benchmark_results.txt'):
+    """Save results for an epoch to file"""
+    with open(filename, 'a') as f:
+        f.write(f"\nResults for epoch {epoch}:\n")
+        for steps, reward in rewards_dict.items():
+            f.write(f"Diffusion steps {steps}: {reward}\n")
+        f.write("-" * 50 + "\n")
 
+if __name__ == "__main__":
+    # Initialize dataset first for normalization stats
+    dataset_path = "pusht_cchi_v7_replay.zarr.zip"
+    pred_horizon = 16
+    obs_horizon = 2
+    action_horizon = 8
+    
+    print("Loading dataset for normalization stats...")
+    dataset = PushTImageDataset(
+        dataset_path=dataset_path,
+        pred_horizon=pred_horizon,
+        obs_horizon=obs_horizon,
+        action_horizon=action_horizon
+    )
 
-# Initialize models
-vision_encoder = VisionEncoder(
-    input_channels=3,
-    output_dim=512,
-    obs_horizon=2
-).to(device)
+    # Initialize models
+    vision_encoder = VisionEncoder(
+        input_channels=3,
+        output_dim=512,
+        obs_horizon=obs_horizon
+    ).to(device)
 
-# Vision encoder outputs 512-dim per timestep
-vision_dim = 512
-# Agent position is 2D
-pos_dim = 2
-# Total conditioning per timestep
-global_cond_dim = (vision_dim + pos_dim) * 2  # 2 is obs_horizon
+    # Vision encoder outputs 512-dim per timestep
+    vision_dim = 512
+    pos_dim = 2
+    global_cond_dim = (vision_dim + pos_dim) * obs_horizon
 
-noise_pred_net = ConditionalUnet1D(
-    input_dim=2,  # action dimension
-    global_cond_dim=global_cond_dim,
-    down_dims=[256, 512, 1024],
-    kernel_size=5,
-    n_groups=8
-).to(device)
+    noise_pred_net = ConditionalUnet1D(
+        input_dim=2,
+        global_cond_dim=global_cond_dim,
+        diffusion_step_embed_dim=256,
+        down_dims=[256, 512, 1024],
+        kernel_size=5,
+        n_groups=8
+    ).to(device)
 
-# Create flow matching model with vision encoder
-flow_model = VisionShortcutModel(
-    model=noise_pred_net,
-    vision_encoder=vision_encoder,
-    num_steps=100,
-    device=device
-)
+    # Create flow matching model
+    flow_model = VisionShortcutModel(
+        model=noise_pred_net,
+        vision_encoder=vision_encoder,
+        num_steps=100,
+        device=device
+    )
 
-print('20 epochs')
-flow_model.load_checkpoint('/home/imahajan/diffusion/checkpoints/epoch_20.pt')
-bv1 = benchmark(flow_model, 1, mode='vision')
-bv2 = benchmark(flow_model, 2, mode='vision')
-bv4 = benchmark(flow_model, 4, mode='vision')
-bv8 = benchmark(flow_model, 8, mode='vision')
-bv16 = benchmark(flow_model, 16, mode='vision')
-bv32 = benchmark(flow_model, 32, mode='vision')
+    # Clear previous results file
+    open('benchmark_results.txt', 'w').close()
 
-print('60 epochs')
-flow_model.load_checkpoint('/home/imahajan/diffusion/checkpoints/epoch_60.pt')
-bv1 = benchmark(flow_model, 1, mode='vision')
-bv2 = benchmark(flow_model, 2, mode='vision')
-bv4 = benchmark(flow_model, 4, mode='vision')
-bv8 = benchmark(flow_model, 8, mode='vision')
-bv16 = benchmark(flow_model, 16, mode='vision')
-bv32 = benchmark(flow_model, 32, mode='vision')
+    # Test epochs 40, 60, 80, 100
+    for epoch in [60, 80, 100]:
+        print(f'\nTesting epoch {epoch}')
+        try:
+            checkpoint = torch.load(
+                f'/home/imahajan/diffusion/checkpoints/epoch_{epoch}.pt',
+                map_location=device,
+                weights_only=False  # Explicitly set for PyTorch 2.6
+            )
+            noise_pred_net.load_state_dict(checkpoint['model_state_dict'])
+            vision_encoder.load_state_dict(checkpoint['vision_encoder_state_dict'])
+            print(f"Successfully loaded checkpoint for epoch {epoch}")
+        except Exception as e:
+            print(f"Failed to load checkpoint for epoch {epoch}: {e}")
+            continue
+        
+        # Dictionary to store results for this epoch
+        results = {}
+        
+        # Test different diffusion steps
+        for steps in [1, 2, 4, 8, 16, 32]:
+            print(f'\nTesting {steps} diffusion steps')
+            rewards, _, _ = benchmark(
+                flow_model, 
+                steps, 
+                mode='vision', 
+                dataset=dataset,
+                pred_horizon=pred_horizon
+            )
+            results[steps] = np.mean(rewards)
+        
+        # Save results for this epoch
+        save_results(epoch, results)
 
-print('75 epochs')
-flow_model.load_checkpoint('/home/imahajan/diffusion/checkpoints/epoch_75.pt')
-bv1 = benchmark(flow_model, 1, mode='vision')
-bv2 = benchmark(flow_model, 2, mode='vision')
-bv4 = benchmark(flow_model, 4, mode='vision')
-bv8 = benchmark(flow_model, 8, mode='vision')
-bv16 = benchmark(flow_model, 16, mode='vision')
-bv32 = benchmark(flow_model, 32, mode='vision')
+    print("\nBenchmarking complete! Results saved to benchmark_results.txt")

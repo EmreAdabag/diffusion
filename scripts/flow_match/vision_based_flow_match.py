@@ -252,41 +252,30 @@ def replace_bn_with_gn(
     return root_module
 
 class VisionEncoder(nn.Module):
-    def __init__(self, input_channels=3, output_dim=512, obs_horizon=2):
+    def __init__(self, input_channels=3, obs_horizon=2):
         super().__init__()
         self.obs_horizon = obs_horizon
         
-        # Use ResNet18 backbone
-        resnet = torchvision.models.resnet18(weights=None)
+        # Use ResNet18 backbone with 512 output dim
+        resnet = get_resnet('resnet18')
         
-        # Replace BatchNorm with GroupNorm for better few-shot performance
+        # Replace BatchNorm with GroupNorm
         replace_bn_with_gn(resnet)
         
-        # Remove last few layers
-        resnet.layer4 = nn.Identity()  # Remove last ResNet block
-        resnet.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        resnet.fc = nn.Sequential(
-            nn.Linear(256, output_dim),
-            nn.Mish()
-        )
+        # Keep layer4 and use Identity for fc to maintain 512 dim
+        resnet.fc = nn.Identity()
         
         self.encoder = resnet
     
     def forward(self, x):
-        # x shape: (batch_size, obs_horizon, height, width, channels)
         B, T, H, W, C = x.shape
+        x_flat = x.flatten(end_dim=1)  # [B*T, H, W, C]
+        x_flat = x_flat.permute(0, 3, 1, 2)  # [B*T, C, H, W]
         
-        # Process each timestep
-        features = []
-        for t in range(T):
-            x_t = x[:, t].permute(0, 3, 1, 2)  # [B, C, H, W]
-            feat = self.encoder(x_t)
-            features.append(feat)
-            
-        # Stack and flatten
-        x = torch.stack(features, dim=1)  # [B, T, output_dim]
-        x = x.reshape(B, -1)  # [B, T*output_dim]
-        return x
+        features = self.encoder(x_flat)  # [B*T, 512]
+        features = features.reshape(B, T, -1)  # [B, T, 512]
+        
+        return features
 
 class VisionShortcutModel():
     def __init__(self, model=None, vision_encoder=None, num_steps=1000, device='cuda'):
@@ -540,7 +529,6 @@ def main():
     # Initialize models
     vision_encoder = VisionEncoder(
         input_channels=3,
-        output_dim=512,
         obs_horizon=obs_horizon
     ).to(device)
     vision_encoder.train()
@@ -563,12 +551,17 @@ def main():
     ).to(device)
     noise_pred_net.train()
 
-    print(f"Total parameters: {sum(p.numel() for p in noise_pred_net.parameters()) + sum(p.numel() for p in vision_encoder.parameters())}")
+    # Create ModuleDict to organize networks - match diffusion exactly
+    nets = nn.ModuleDict({
+        'vision_encoder': vision_encoder,
+        'noise_pred_net': noise_pred_net
+    })
+
+    print(f"Total parameters: {sum(p.numel() for p in nets.parameters())}")
 
     # Create optimizer with parameters from both model and vision encoder
     optimizer = torch.optim.AdamW([
-        {'params': noise_pred_net.parameters(), 'lr': 1e-4},
-        {'params': vision_encoder.parameters(), 'lr': 5e-5}
+        {'params': nets.parameters(), 'lr': 1e-4}
     ], weight_decay=1e-6)
 
     # Learning rate scheduler
@@ -587,8 +580,7 @@ def main():
         try:
             # First try with weights_only=False (safer for our use case)
             checkpoint = torch.load(checkpoint_path, weights_only=False, map_location=device)
-            noise_pred_net.load_state_dict(checkpoint['model_state_dict'])
-            vision_encoder.load_state_dict(checkpoint['vision_encoder_state_dict'])
+            nets.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             start_epoch = checkpoint['epoch']
@@ -599,8 +591,7 @@ def main():
             try:
                 # If that fails, try with map_location and no weights_only
                 checkpoint = torch.load(checkpoint_path, map_location=device)
-                noise_pred_net.load_state_dict(checkpoint['model_state_dict'])
-                vision_encoder.load_state_dict(checkpoint['vision_encoder_state_dict'])
+                nets.load_state_dict(checkpoint['model_state_dict'])
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
                 start_epoch = checkpoint['epoch']
@@ -621,30 +612,30 @@ def main():
                 with tqdm(dataloader, desc='Batch', leave=False) as tepoch:
                     for nbatch in tepoch:
                         # Move data to device
-                        nimage = nbatch['image'].to(device)
-                        nagent_pos = nbatch['agent_pos'].to(device)
+                        nimage = nbatch['image'].to(device)  # [B, T, H, W, C]
+                        nagent_pos = nbatch['agent_pos'].to(device)  # [B, T, 2]
                         naction = nbatch['action'].to(device)
                         
                         B = nimage.shape[0]
 
-                        # Get vision features and combine with agent positions
-                        vision_features = vision_encoder(nimage)
-                        global_cond = torch.cat([
-                            vision_features.flatten(1),
-                            nagent_pos.flatten(1)
-                        ], dim=1)
+                        # Vision encoder - match diffusion exactly
+                        image_features = nets['vision_encoder'](nimage)  # [B, T, 512]
+                        # Combine with agent positions
+                        obs = torch.cat([image_features, nagent_pos], dim=-1)  # [B, T, 514]
+                        global_cond = obs.flatten(start_dim=1)  # [B, T*514]
 
-                        # Flow matching training - match state-based exactly
-                        # Sample random time steps
+                        # Flow matching training
                         t = torch.rand(B, device=device)
-                        # Sample noise and interpolate
                         z0 = torch.randn_like(naction)
                         z1 = naction
-                        # Linear interpolation between noise and target
                         zt = t.view(-1, 1, 1) * z1 + (1 - t.view(-1, 1, 1)) * z0
                         
-                        # Predict velocity field
-                        pred_v = noise_pred_net(zt, t, global_cond=global_cond)
+                        # Predict using noise_pred_net through ModuleDict
+                        pred_v = nets['noise_pred_net'](
+                            sample=zt,
+                            timestep=t,
+                            global_cond=global_cond
+                        )
                         # Target velocity is constant throughout trajectory
                         target_v = z1 - z0  # Constant target, independent of t
                         
@@ -656,8 +647,7 @@ def main():
                         loss.backward()
 
                         # Gradient clipping - match state-based
-                        torch.nn.utils.clip_grad_norm_(noise_pred_net.parameters(), 1.0)
-                        torch.nn.utils.clip_grad_norm_(vision_encoder.parameters(), 0.5)
+                        torch.nn.utils.clip_grad_norm_(nets.parameters(), 1.0)
 
                         optimizer.step()
                         optimizer.zero_grad()
@@ -682,8 +672,7 @@ def main():
                 if (epoch_idx + 1) % checkpoint_freq == 0:
                     checkpoint = {
                         'epoch': epoch_idx + 1,
-                        'model_state_dict': noise_pred_net.state_dict(),
-                        'vision_encoder_state_dict': vision_encoder.state_dict(),
+                        'model_state_dict': nets.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict(),
                         'loss': avg_loss
@@ -697,8 +686,7 @@ def main():
                     best_loss = avg_loss
                     checkpoint = {
                         'epoch': epoch_idx + 1,
-                        'model_state_dict': noise_pred_net.state_dict(),
-                        'vision_encoder_state_dict': vision_encoder.state_dict(),
+                        'model_state_dict': nets.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict(),
                         'loss': avg_loss
@@ -717,8 +705,7 @@ def main():
             # Save final model
             checkpoint = {
                 'epoch': epoch_idx + 1,
-                'model_state_dict': noise_pred_net.state_dict(),
-                'vision_encoder_state_dict': vision_encoder.state_dict(),
+                'model_state_dict': nets.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'loss': avg_loss
@@ -741,7 +728,6 @@ def evaluate():
     # Load models - match state-based exactly
     vision_encoder = VisionEncoder(
         input_channels=3,
-        output_dim=512,
         obs_horizon=obs_horizon
     ).to(device)
     
@@ -754,7 +740,13 @@ def evaluate():
         n_groups=8
     ).to(device)
 
-    print(f"Total parameters: {sum(p.numel() for p in noise_pred_net.parameters()) + sum(p.numel() for p in vision_encoder.parameters())}")
+    # Create ModuleDict to organize networks - match diffusion exactly
+    nets = nn.ModuleDict({
+        'vision_encoder': vision_encoder,
+        'noise_pred_net': noise_pred_net
+    })
+
+    print(f"Total parameters: {sum(p.numel() for p in nets.parameters())}")
 
     # Try to load the best checkpoint
     checkpoint_path = os.path.join('checkpoints', 'best.pt')
@@ -768,23 +760,20 @@ def evaluate():
     try:
         # First try with weights_only=False (safer for our use case)
         checkpoint = torch.load(checkpoint_path, weights_only=False, map_location=device)
-        noise_pred_net.load_state_dict(checkpoint['model_state_dict'])
-        vision_encoder.load_state_dict(checkpoint['vision_encoder_state_dict'])
+        nets.load_state_dict(checkpoint['model_state_dict'])
     except Exception as e:
         print(f"Error loading checkpoint: {e}")
         print("Trying alternative loading method...")
         try:
             # If that fails, try with map_location and no weights_only
             checkpoint = torch.load(checkpoint_path, map_location=device)
-            noise_pred_net.load_state_dict(checkpoint['model_state_dict'])
-            vision_encoder.load_state_dict(checkpoint['vision_encoder_state_dict'])
+            nets.load_state_dict(checkpoint['model_state_dict'])
         except Exception as e:
             print(f"All loading attempts failed: {e}")
             return
 
     # Set to evaluation mode
-    noise_pred_net.eval()
-    vision_encoder.eval()
+    nets.eval()
 
     # Try different seeds for evaluation
     eval_seed = 200000
@@ -849,22 +838,24 @@ def evaluate():
 
             # Sample actions using flow matching - match state-based exactly
             with torch.no_grad():
-                # Get vision features and combine with agent positions
-                vision_features = vision_encoder(obs_tensor)
-                global_cond = torch.cat([
-                    vision_features.flatten(1),
-                    pos_tensor.flatten(1)
-                ], dim=1)
+                # Get vision features using ModuleDict
+                image_features = nets['vision_encoder'](obs_tensor)  # [1, T, 512]
+                obs = torch.cat([image_features, pos_tensor], dim=-1)  # [1, T, 514]
+                global_cond = obs.flatten(start_dim=1)  # [1, T*514]
                 
                 # Initial noise
                 z0 = torch.randn((1, pred_horizon, 2), device=device)
                 zt = z0
                 
-                # Euler integration with fixed target
+                # Euler integration using ModuleDict
                 dt = 1.0 / ode_steps
                 for i in range(ode_steps):
                     t = torch.ones(1, device=device) * i * dt
-                    v = noise_pred_net(zt, t, global_cond=global_cond)
+                    v = nets['noise_pred_net'](
+                        sample=zt,
+                        timestep=t,
+                        global_cond=global_cond
+                    )
                     zt = zt + v * dt
                 
                 # Take action after obs_horizon (same as state-based)

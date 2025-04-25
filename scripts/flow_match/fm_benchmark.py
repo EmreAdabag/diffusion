@@ -692,10 +692,12 @@ def benchmark(model, diffusion_steps=1, mode='state', dataset=None, pred_horizon
 
     # save rewards
     final_rewards = np.zeros(episodes)
+    max_rewards = np.zeros(episodes)
 
-    with tqdm(total=episodes, desc="Eval PushTStateEnv") as pbar:
+    with tqdm(total=episodes, desc="Eval PushTEnv") as pbar:
         for ep in range(episodes):
             reward = 0.0
+            max_reward = 0.0
             
             # get first observation
             obs, info = env.reset()
@@ -768,15 +770,18 @@ def benchmark(model, diffusion_steps=1, mode='state', dataset=None, pred_horizon
                 if step_idx > max_steps:
                     done = True
 
+                max_reward = max(max_reward, reward)
+
             ends[ep] = env._get_state()
             steps[ep] = step_idx
             avgtimes[ep] = np.mean(eptimes)
             pbar.update(1)
-            pbar.set_postfix(avg_reward=sum(final_rewards[:ep+1])/(ep+1))
+            pbar.set_postfix(avg_max_reward=sum(max_rewards[:ep+1])/(ep+1))
             final_rewards[ep] = reward
+            max_rewards[ep] = max_reward
             
-    print(f'Final reward: {sum(final_rewards)/episodes}')
-    return final_rewards, starts, ends
+    print(f'Average max reward: {sum(max_rewards)/episodes}')
+    return max_rewards, starts, ends
 
 def save_results(epoch, rewards_dict, filename='benchmark_results.txt'):
     """Save results for an epoch to file"""
@@ -834,7 +839,7 @@ if __name__ == "__main__":
     open('benchmark_results.txt', 'w').close()
 
     # Test epochs 40, 60, 80, 100
-    for epoch in [60, 80, 100]:
+    for epoch in [40, 60, 80, 100]:
         print(f'\nTesting epoch {epoch}')
         try:
             checkpoint = torch.load(

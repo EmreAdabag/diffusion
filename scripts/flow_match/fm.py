@@ -1235,20 +1235,28 @@ class FlowMatchingScheduler:
         self.timesteps = torch.linspace(0, 1, num_inference_timesteps)
         return self.timesteps
 
+# Modified training script with checkpoint saving and loading
+
 # Main script
 if __name__ == "__main__":
-    # Download demonstration data from Google Drive
-    dataset_path = "pusht_cchi_v7_replay.zarr.zip"
-    if not os.path.isfile(dataset_path):
-        id = "1KY1InLurpMvJDRb14L9NlXT_fEsCvVUq&confirm=t"
-        gdown.download(id=id, output=dataset_path, quiet=False)
-    
     # Parameters
     pred_horizon = 16
     obs_horizon = 2
     action_horizon = 8
     num_epochs = 100
     num_flow_timesteps = 100
+    save_checkpoint_interval = 20  # Save every 20 epochs
+    resume_from_checkpoint = False  # Set to True to resume training
+    checkpoint_path = 'checkpoints/flow_matching_latest.pt'  # Path to resume from
+    
+    # Create directory for checkpoints
+    os.makedirs('checkpoints', exist_ok=True)
+    
+    # Download demonstration data from Google Drive
+    dataset_path = "pusht_cchi_v7_replay.zarr.zip"
+    if not os.path.isfile(dataset_path):
+        id = "1KY1InLurpMvJDRb14L9NlXT_fEsCvVUq&confirm=t"
+        gdown.download(id=id, output=dataset_path, quiet=False)
     
     # Create dataset from file
     dataset = PushTImageDataset(
@@ -1322,8 +1330,43 @@ if __name__ == "__main__":
         num_training_steps=len(dataloader) * num_epochs
     )
     
+    # Resume training if requested
+    start_epoch = 0
+    if resume_from_checkpoint and os.path.exists(checkpoint_path):
+        def load_checkpoint(checkpoint_path, nets, optimizer=None, lr_scheduler=None, device='cuda'):
+            print(f"Loading checkpoint from {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            
+            # Load model weights
+            nets.load_state_dict(checkpoint['model_state_dict'])
+            
+            # If optimizer is provided (resuming training)
+            if optimizer is not None:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            
+            # If lr_scheduler is provided (resuming training)
+            if lr_scheduler is not None and 'lr_scheduler_state_dict' in checkpoint:
+                lr_scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])
+            
+            # Get the epoch and stats
+            epoch = checkpoint.get('epoch', 0)
+            loaded_stats = checkpoint.get('stats', None)
+            
+            print(f"Loaded checkpoint from epoch {epoch}")
+            return epoch, loaded_stats, nets
+            
+        start_epoch, loaded_stats, nets = load_checkpoint(
+            checkpoint_path, nets, optimizer, lr_scheduler, device
+        )
+        
+        # Use loaded stats if available
+        if loaded_stats is not None:
+            stats = loaded_stats
+            
+        print(f"Resuming training from epoch {start_epoch}")
+    
     # TRAINING LOOP WITH FLOW MATCHING
-    with tqdm(range(num_epochs), desc='Epoch') as tglobal:
+    with tqdm(range(start_epoch, num_epochs), desc='Epoch') as tglobal:
         # epoch loop
         for epoch_idx in tglobal:
             epoch_loss = list()
@@ -1393,6 +1436,32 @@ if __name__ == "__main__":
                     loss_cpu = loss.item()
                     epoch_loss.append(loss_cpu)
                     tepoch.set_postfix(loss=loss_cpu)
+            
+            # Save checkpoint at specified intervals or at the last epoch
+            if ((epoch_idx + 1) % save_checkpoint_interval == 0) or (epoch_idx == num_epochs - 1):
+                # Create a temporary copy of the model with EMA weights
+                ema_nets = nets.state_dict().copy()  # Make a copy of the current state dict
+                ema.copy_to(ema_nets)  # Copy EMA weights into the copy
+                
+                # Save both the model state and optimizer state for resuming training
+                checkpoint = {
+                    'epoch': epoch_idx + 1,
+                    'model_state_dict': ema_nets,
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'lr_scheduler_state_dict': lr_scheduler.state_dict(),
+                    'loss': np.mean(epoch_loss),
+                    'stats': stats  # Save the dataset statistics for inference
+                }
+                
+                # Save checkpoint with epoch number
+                checkpoint_path = os.path.join('checkpoints', f'flow_matching_epoch_{epoch_idx+1}.pt')
+                torch.save(checkpoint, checkpoint_path)
+                print(f"Checkpoint saved: {checkpoint_path}")
+                
+                # Also save the latest model (overwrite)
+                latest_path = os.path.join('checkpoints', 'flow_matching_latest.pt')
+                torch.save(checkpoint, latest_path)
+                print(f"Latest model saved: {latest_path}")
             
             tglobal.set_postfix(loss=np.mean(epoch_loss))
     
@@ -1510,309 +1579,3 @@ if __name__ == "__main__":
     # visualize
     vwrite('vis_flow_matching.mp4', imgs)
     Video('vis_flow_matching.mp4', embed=True, width=256, height=256)
-
-
-# #@markdown ### **Network Demo**
-
-# # construct ResNet18 encoder
-# # if you have multiple camera views, use seperate encoder weights for each view.
-# vision_encoder = get_resnet('resnet18')
-
-# # IMPORTANT!
-# # replace all BatchNorm with GroupNorm to work with EMA
-# # performance will tank if you forget to do this!
-# vision_encoder = replace_bn_with_gn(vision_encoder)
-
-# # ResNet18 has output dim of 512
-# vision_feature_dim = 512
-# # agent_pos is 2 dimensional
-# lowdim_obs_dim = 2
-# # observation feature has 514 dims in total per step
-# obs_dim = vision_feature_dim + lowdim_obs_dim
-# action_dim = 2
-
-# # create network object
-# noise_pred_net = ConditionalUnet1D(
-#     input_dim=action_dim,
-#     global_cond_dim=obs_dim*obs_horizon
-# )
-
-# # the final arch has 2 parts
-# nets = nn.ModuleDict({
-#     'vision_encoder': vision_encoder,
-#     'noise_pred_net': noise_pred_net
-# })
-
-# # demo
-# with torch.no_grad():
-#     # example inputs
-#     image = torch.zeros((1, obs_horizon,3,96,96))
-#     agent_pos = torch.zeros((1, obs_horizon, 2))
-#     # vision encoder
-#     image_features = nets['vision_encoder'](
-#         image.flatten(end_dim=1))
-#     # (2,512)
-#     image_features = image_features.reshape(*image.shape[:2],-1)
-#     # (1,2,512)
-#     obs = torch.cat([image_features, agent_pos],dim=-1)
-#     # (1,2,514)
-
-#     noised_action = torch.randn((1, pred_horizon, action_dim))
-#     diffusion_iter = torch.zeros((1,))
-
-#     # the noise prediction network
-#     # takes noisy action, diffusion iteration and observation as input
-#     # predicts the noise added to action
-#     noise = nets['noise_pred_net'](
-#         sample=noised_action,
-#         timestep=diffusion_iter,
-#         global_cond=obs.flatten(start_dim=1))
-
-#     # illustration of removing noise
-#     # the actual noise removal is performed by NoiseScheduler
-#     # and is dependent on the diffusion noise schedule
-#     denoised_action = noised_action - noise
-
-# # for this demo, we use DDPMScheduler with 100 diffusion iterations
-# num_diffusion_iters = 100
-# noise_scheduler = DDPMScheduler(
-#     num_train_timesteps=num_diffusion_iters,
-#     # the choise of beta schedule has big impact on performance
-#     # we found squared cosine works the best
-#     beta_schedule='squaredcos_cap_v2',
-#     # clip output to [-1,1] to improve stability
-#     clip_sample=True,
-#     # our network predicts noise (instead of denoised action)
-#     prediction_type='epsilon'
-# )
-
-# # device transfer
-# device = torch.device('cuda')
-# _ = nets.to(device)
-
-# #@markdown ### **Training**
-# #@markdown
-# #@markdown Takes about 2.5 hours. If you don't want to wait, skip to the next cell
-# #@markdown to load pre-trained weights
-
-# num_epochs = 100
-
-# # Exponential Moving Average
-# # accelerates training and improves stability
-# # holds a copy of the model weights
-# ema = EMAModel(
-#     parameters=nets.parameters(),
-#     power=0.75)
-
-# # Standard ADAM optimizer
-# # Note that EMA parametesr are not optimized
-# optimizer = torch.optim.AdamW(
-#     params=nets.parameters(),
-#     lr=1e-4, weight_decay=1e-6)
-
-# # Cosine LR schedule with linear warmup
-# lr_scheduler = get_scheduler(
-#     name='cosine',
-#     optimizer=optimizer,
-#     num_warmup_steps=500,
-#     num_training_steps=len(dataloader) * num_epochs
-# )
-
-# with tqdm(range(num_epochs), desc='Epoch') as tglobal:
-#     # epoch loop
-#     for epoch_idx in tglobal:
-#         epoch_loss = list()
-#         # batch loop
-#         with tqdm(dataloader, desc='Batch', leave=False) as tepoch:
-#             for nbatch in tepoch:
-#                 # data normalized in dataset
-#                 # device transfer
-#                 nimage = nbatch['image'][:,:obs_horizon].to(device)
-#                 nagent_pos = nbatch['agent_pos'][:,:obs_horizon].to(device)
-#                 naction = nbatch['action'].to(device)
-#                 B = nagent_pos.shape[0]
-
-#                 # encoder vision features
-#                 image_features = nets['vision_encoder'](
-#                     nimage.flatten(end_dim=1))
-#                 image_features = image_features.reshape(
-#                     *nimage.shape[:2],-1)
-#                 # (B,obs_horizon,D)
-
-#                 # concatenate vision feature and low-dim obs
-#                 obs_features = torch.cat([image_features, nagent_pos], dim=-1)
-#                 obs_cond = obs_features.flatten(start_dim=1)
-#                 # (B, obs_horizon * obs_dim)
-
-#                 # sample noise to add to actions
-#                 noise = torch.randn(naction.shape, device=device)
-
-#                 # sample a diffusion iteration for each data point
-#                 timesteps = torch.randint(
-#                     0, noise_scheduler.config.num_train_timesteps,
-#                     (B,), device=device
-#                 ).long()
-
-#                 # add noise to the clean images according to the noise magnitude at each diffusion iteration
-#                 # (this is the forward diffusion process)
-#                 noisy_actions = noise_scheduler.add_noise(
-#                     naction, noise, timesteps)
-
-#                 # predict the noise residual
-#                 noise_pred = noise_pred_net(
-#                     noisy_actions, timesteps, global_cond=obs_cond)
-
-#                 # L2 loss
-#                 loss = nn.functional.mse_loss(noise_pred, noise)
-
-#                 # optimize
-#                 loss.backward()
-#                 optimizer.step()
-#                 optimizer.zero_grad()
-#                 # step lr scheduler every batch
-#                 # this is different from standard pytorch behavior
-#                 lr_scheduler.step()
-
-#                 # update Exponential Moving Average of the model weights
-#                 ema.step(nets.parameters())
-
-#                 # logging
-#                 loss_cpu = loss.item()
-#                 epoch_loss.append(loss_cpu)
-#                 tepoch.set_postfix(loss=loss_cpu)
-#         tglobal.set_postfix(loss=np.mean(epoch_loss))
-
-# # Weights of the EMA model
-# # is used for inference
-# ema_nets = nets
-# ema.copy_to(ema_nets.parameters())
-
-# #@markdown ### **Loading Pretrained Checkpoint**
-# #@markdown Set `load_pretrained = True` to load pretrained weights.
-
-# load_pretrained = False
-# if load_pretrained:
-#   ckpt_path = "pusht_vision_100ep.ckpt"
-#   if not os.path.isfile(ckpt_path):
-#       id = "1XKpfNSlwYMGaF5CncoFaLKCDTWoLAHf1&confirm=t"
-#       gdown.download(id=id, output=ckpt_path, quiet=False)
-
-#   state_dict = torch.load(ckpt_path, map_location='cuda')
-#   ema_nets = nets
-#   ema_nets.load_state_dict(state_dict)
-#   print('Pretrained weights loaded.')
-# else:
-#   print("Skipped pretrained weight loading.")
-
-# #@markdown ### **Inference**
-
-# # limit enviornment interaction to 200 steps before termination
-# max_steps = 200
-# env = PushTImageEnv()
-# # use a seed >200 to avoid initial states seen in the training dataset
-# env.seed(100000)
-
-# # get first observation
-# obs, info = env.reset()
-
-# # keep a queue of last 2 steps of observations
-# obs_deque = collections.deque(
-#     [obs] * obs_horizon, maxlen=obs_horizon)
-# # save visualization and rewards
-# imgs = [env.render(mode='rgb_array')]
-# rewards = list()
-# done = False
-# step_idx = 0
-
-# with tqdm(total=max_steps, desc="Eval PushTImageEnv") as pbar:
-#     while not done:
-#         B = 1
-#         # stack the last obs_horizon number of observations
-#         images = np.stack([x['image'] for x in obs_deque])
-#         agent_poses = np.stack([x['agent_pos'] for x in obs_deque])
-
-#         # normalize observation
-#         nagent_poses = normalize_data(agent_poses, stats=stats['agent_pos'])
-#         # images are already normalized to [0,1]
-#         nimages = images
-
-#         # device transfer
-#         nimages = torch.from_numpy(nimages).to(device, dtype=torch.float32)
-#         # (2,3,96,96)
-#         nagent_poses = torch.from_numpy(nagent_poses).to(device, dtype=torch.float32)
-#         # (2,2)
-
-#         # infer action
-#         with torch.no_grad():
-#             # get image features
-#             image_features = ema_nets['vision_encoder'](nimages)
-#             # (2,512)
-
-#             # concat with low-dim observations
-#             obs_features = torch.cat([image_features, nagent_poses], dim=-1)
-
-#             # reshape observation to (B,obs_horizon*obs_dim)
-#             obs_cond = obs_features.unsqueeze(0).flatten(start_dim=1)
-
-#             # initialize action from Guassian noise
-#             noisy_action = torch.randn(
-#                 (B, pred_horizon, action_dim), device=device)
-#             naction = noisy_action
-
-#             # init scheduler
-#             noise_scheduler.set_timesteps(num_diffusion_iters)
-
-#             for k in noise_scheduler.timesteps:
-#                 # predict noise
-#                 noise_pred = ema_nets['noise_pred_net'](
-#                     sample=naction,
-#                     timestep=k,
-#                     global_cond=obs_cond
-#                 )
-
-#                 # inverse diffusion step (remove noise)
-#                 naction = noise_scheduler.step(
-#                     model_output=noise_pred,
-#                     timestep=k,
-#                     sample=naction
-#                 ).prev_sample
-
-#         # unnormalize action
-#         naction = naction.detach().to('cpu').numpy()
-#         # (B, pred_horizon, action_dim)
-#         naction = naction[0]
-#         action_pred = unnormalize_data(naction, stats=stats['action'])
-
-#         # only take action_horizon number of actions
-#         start = obs_horizon - 1
-#         end = start + action_horizon
-#         action = action_pred[start:end,:]
-#         # (action_horizon, action_dim)
-
-#         # execute action_horizon number of steps
-#         # without replanning
-#         for i in range(len(action)):
-#             # stepping env
-#             obs, reward, done, _, info = env.step(action[i])
-#             # save observations
-#             obs_deque.append(obs)
-#             # and reward/vis
-#             rewards.append(reward)
-#             imgs.append(env.render(mode='rgb_array'))
-
-#             # update progress bar
-#             step_idx += 1
-#             pbar.update(1)
-#             pbar.set_postfix(reward=reward)
-#             if step_idx > max_steps:
-#                 done = True
-#             if done:
-#                 break
-
-# # print out the maximum target coverage
-# print('Score: ', max(rewards))
-
-# # visualize
-# from IPython.display import Video
-# vwrite('vis.mp4', imgs)
-# Video('vis.mp4', embed=True, width=256, height=256)

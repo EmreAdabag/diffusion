@@ -596,13 +596,17 @@ class PushTImageEnv(PushTEnv):
             legacy=False,
             block_cog=None,
             damping=None,
-            render_size=96):
+            render_size=96,
+            seed=None):
         super().__init__(
             legacy=legacy,
             block_cog=block_cog,
             damping=damping,
             render_size=render_size,
             render_action=False)
+
+        if seed is not None:
+            self.seed(seed)
         ws = self.window_size
         self.observation_space = spaces.Dict({
             'image': spaces.Box(

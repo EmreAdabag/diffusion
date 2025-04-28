@@ -1437,16 +1437,14 @@ if __name__ == "__main__":
                     epoch_loss.append(loss_cpu)
                     tepoch.set_postfix(loss=loss_cpu)
             
-            # Save checkpoint at specified intervals or at the last epoch
             if ((epoch_idx + 1) % save_checkpoint_interval == 0) or (epoch_idx == num_epochs - 1):
-                # Create a temporary copy of the model with EMA weights
-                ema_nets = nets.state_dict().copy()  # Make a copy of the current state dict
-                ema.copy_to(ema_nets)  # Copy EMA weights into the copy
+                # Save model with EMA weights
+                ema.copy_to(nets.parameters())  # Copy EMA weights directly to the model
                 
-                # Save both the model state and optimizer state for resuming training
+                # Save the model state and optimizer state for resuming training
                 checkpoint = {
                     'epoch': epoch_idx + 1,
-                    'model_state_dict': ema_nets,
+                    'model_state_dict': nets.state_dict(),  # Save the state dict with EMA weights
                     'optimizer_state_dict': optimizer.state_dict(),
                     'lr_scheduler_state_dict': lr_scheduler.state_dict(),
                     'loss': np.mean(epoch_loss),

@@ -1,875 +1,401 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[1]:
+# Simple Flow Matching Benchmark that outputs results to a text file
 
-
-#@markdown ### **Imports**
-# diffusion policy import
-from typing import Tuple, Sequence
+import os
 import numpy as np
 import torch
 import collections
-from tqdm.auto import tqdm
-
-# env import
-import gym
-from gym import spaces
-import pygame
-import pymunk
-import pymunk.pygame_util
-from pymunk.space_debug_draw_options import SpaceDebugColor
-from pymunk.vec2d import Vec2d
-import shapely.geometry as sg
-import cv2
-import skimage.transform as st
-from skvideo.io import vwrite
 import time
-
-# from imm.state_nn import RoboIMM as ImmState
-# from imm.vision_nn import RoboIMM as ImmVision
+from tqdm.auto import tqdm
+import argparse
 import pickle
 
-# Import the correct models and functions
-from vision_based_flow_match import (
-    VisionEncoder, 
-    ConditionalUnet1D,
-    VisionShortcutModel,
-    normalize_data,
-    unnormalize_data,
-    PushTImageDataset
+# Add safe global for numpy scalar
+torch.serialization.add_safe_globals(['numpy._core.multiarray.scalar'])
+
+# Import directly from your existing fm.py implementation
+import fm
+from fm import (
+    PushTEnv, 
+    PushTImageEnv,
+    FlowMatchingScheduler,
+    normalize_data, 
+    unnormalize_data
 )
 
-# Check for different GPU backends
-if torch.cuda.is_available():
-    device = torch.device('cuda')
-elif hasattr(torch, 'hip') and torch.hip.is_available():  # AMD GPUs with ROCm
-    device = torch.device('hip')
-else:
-    device = torch.device('cpu')
-    
-print(f"Using device: {device}")
-
-# In[2]:
-
-
-#@markdown ### **Environment**
-#@markdown Defines a PyMunk-based Push-T environment `PushTEnv`.
-#@markdown
-#@markdown **Goal**: push the gray T-block into the green area.
-#@markdown
-#@markdown Adapted from [Implicit Behavior Cloning](https://implicitbc.github.io/)
-
-
-positive_y_is_up: bool = False
-"""Make increasing values of y point upwards.
-
-When True::
-
-    y
-    ^
-    |      . (3, 3)
-    |
-    |   . (2, 2)
-    |
-    +------ > x
-
-When False::
-
-    +------ > x
-    |
-    |   . (2, 2)
-    |
-    |      . (3, 3)
-    v
-    y
-
-"""
-
-def to_pygame(p: Tuple[float, float], surface: pygame.Surface) -> Tuple[int, int]:
-    """Convenience method to convert pymunk coordinates to pygame surface
-    local coordinates.
-
-    Note that in case positive_y_is_up is False, this function wont actually do
-    anything except converting the point to integers.
-    """
-    if positive_y_is_up:
-        return round(p[0]), surface.get_height() - round(p[1])
-    else:
-        return round(p[0]), round(p[1])
-
-
-def light_color(color: SpaceDebugColor):
-    color = np.minimum(1.2 * np.float32([color.r, color.g, color.b, color.a]), np.float32([255]))
-    color = SpaceDebugColor(r=color[0], g=color[1], b=color[2], a=color[3])
-    return color
-
-class DrawOptions(pymunk.SpaceDebugDrawOptions):
-    def __init__(self, surface: pygame.Surface) -> None:
-        """Draw a pymunk.Space on a pygame.Surface object.
-
-        Typical usage::
-
-        >>> import pymunk
-        >>> surface = pygame.Surface((10,10))
-        >>> space = pymunk.Space()
-        >>> options = pymunk.pygame_util.DrawOptions(surface)
-        >>> space.debug_draw(options)
-
-        You can control the color of a shape by setting shape.color to the color
-        you want it drawn in::
-
-        >>> c = pymunk.Circle(None, 10)
-        >>> c.color = pygame.Color("pink")
-
-        See pygame_util.demo.py for a full example
-
-        Since pygame uses a coordiante system where y points down (in contrast
-        to many other cases), you either have to make the physics simulation
-        with Pymunk also behave in that way, or flip everything when you draw.
-
-        The easiest is probably to just make the simulation behave the same
-        way as Pygame does. In that way all coordinates used are in the same
-        orientation and easy to reason about::
-
-        >>> space = pymunk.Space()
-        >>> space.gravity = (0, -1000)
-        >>> body = pymunk.Body()
-        >>> body.position = (0, 0) # will be positioned in the top left corner
-        >>> space.debug_draw(options)
-
-        To flip the drawing its possible to set the module property
-        :py:data:`positive_y_is_up` to True. Then the pygame drawing will flip
-        the simulation upside down before drawing::
-
-        >>> positive_y_is_up = True
-        >>> body = pymunk.Body()
-        >>> body.position = (0, 0)
-        >>> # Body will be position in bottom left corner
-
-        :Parameters:
-                surface : pygame.Surface
-                    Surface that the objects will be drawn on
+class FlowMatchingModel:
+    def __init__(self, 
+                 obs_horizon=2, 
+                 pred_horizon=16, 
+                 action_dim=2, 
+                 num_particles=1,
+                 seed=None):
         """
-        self.surface = surface
-        super(DrawOptions, self).__init__()
-
-    def draw_circle(
-        self,
-        pos: Vec2d,
-        angle: float,
-        radius: float,
-        outline_color: SpaceDebugColor,
-        fill_color: SpaceDebugColor,
-    ) -> None:
-        p = to_pygame(pos, self.surface)
-
-        pygame.draw.circle(self.surface, fill_color.as_int(), p, round(radius), 0)
-        pygame.draw.circle(self.surface, light_color(fill_color).as_int(), p, round(radius-4), 0)
-
-        circle_edge = pos + Vec2d(radius, 0).rotated(angle)
-        p2 = to_pygame(circle_edge, self.surface)
-        line_r = 2 if radius > 20 else 1
-        # pygame.draw.lines(self.surface, outline_color.as_int(), False, [p, p2], line_r)
-
-    def draw_segment(self, a: Vec2d, b: Vec2d, color: SpaceDebugColor) -> None:
-        p1 = to_pygame(a, self.surface)
-        p2 = to_pygame(b, self.surface)
-
-        pygame.draw.aalines(self.surface, color.as_int(), False, [p1, p2])
-
-    def draw_fat_segment(
-        self,
-        a: Tuple[float, float],
-        b: Tuple[float, float],
-        radius: float,
-        outline_color: SpaceDebugColor,
-        fill_color: SpaceDebugColor,
-    ) -> None:
-        p1 = to_pygame(a, self.surface)
-        p2 = to_pygame(b, self.surface)
-
-        r = round(max(1, radius * 2))
-        pygame.draw.lines(self.surface, fill_color.as_int(), False, [p1, p2], r)
-        if r > 2:
-            orthog = [abs(p2[1] - p1[1]), abs(p2[0] - p1[0])]
-            if orthog[0] == 0 and orthog[1] == 0:
-                return
-            scale = radius / (orthog[0] * orthog[0] + orthog[1] * orthog[1]) ** 0.5
-            orthog[0] = round(orthog[0] * scale)
-            orthog[1] = round(orthog[1] * scale)
-            points = [
-                (p1[0] - orthog[0], p1[1] - orthog[1]),
-                (p1[0] + orthog[0], p1[1] + orthog[1]),
-                (p2[0] + orthog[0], p2[1] + orthog[1]),
-                (p2[0] - orthog[0], p2[1] - orthog[1]),
-            ]
-            pygame.draw.polygon(self.surface, fill_color.as_int(), points)
-            pygame.draw.circle(
-                self.surface,
-                fill_color.as_int(),
-                (round(p1[0]), round(p1[1])),
-                round(radius),
-            )
-            pygame.draw.circle(
-                self.surface,
-                fill_color.as_int(),
-                (round(p2[0]), round(p2[1])),
-                round(radius),
-            )
-
-    def draw_polygon(
-        self,
-        verts: Sequence[Tuple[float, float]],
-        radius: float,
-        outline_color: SpaceDebugColor,
-        fill_color: SpaceDebugColor,
-    ) -> None:
-        ps = [to_pygame(v, self.surface) for v in verts]
-        ps += [ps[0]]
-
-        radius = 2
-        pygame.draw.polygon(self.surface, light_color(fill_color).as_int(), ps)
-
-        if radius > 0:
-            for i in range(len(verts)):
-                a = verts[i]
-                b = verts[(i + 1) % len(verts)]
-                self.draw_fat_segment(a, b, radius, fill_color, fill_color)
-
-    def draw_dot(
-        self, size: float, pos: Tuple[float, float], color: SpaceDebugColor
-    ) -> None:
-        p = to_pygame(pos, self.surface)
-        pygame.draw.circle(self.surface, color.as_int(), p, round(size), 0)
-
-
-def pymunk_to_shapely(body, shapes):
-    geoms = list()
-    for shape in shapes:
-        if isinstance(shape, pymunk.shapes.Poly):
-            verts = [body.local_to_world(v) for v in shape.get_vertices()]
-            verts += [verts[0]]
-            geoms.append(sg.Polygon(verts))
-        else:
-            raise RuntimeError(f'Unsupported shape type {type(shape)}')
-    geom = sg.MultiPolygon(geoms)
-    return geom
-
-# env
-class PushTEnv(gym.Env):
-    metadata = {"render.modes": ["human", "rgb_array"], "video.frames_per_second": 10}
-    reward_range = (0., 1.)
-
-    def __init__(self,
-            legacy=False,
-            block_cog=None, damping=None,
-            render_action=True,
-            render_size=96,
-            reset_to_state=None, 
-            seed=1234
-        ):
-        self._seed = seed
-        self.np_random = np.random.default_rng(seed=self._seed)
-
-        self.window_size = ws = 512  # The size of the PyGame window
-        self.render_size = render_size
-        self.sim_hz = 100
-        # Local controller params.
-        self.k_p, self.k_v = 100, 20    # PD control.z
-        self.control_hz = self.metadata['video.frames_per_second']
-        # legcay set_state for data compatiblity
-        self.legacy = legacy
-
-        # agent_pos, block_pos, block_angle
-        self.observation_space = spaces.Box(
-            low=np.array([0,0,0,0,0], dtype=np.float64),
-            high=np.array([ws,ws,ws,ws,np.pi*2], dtype=np.float64),
-            shape=(5,),
-            dtype=np.float64
-        )
-
-        # positional goal for agent
-        self.action_space = spaces.Box(
-            low=np.array([0,0], dtype=np.float64),
-            high=np.array([ws,ws], dtype=np.float64),
-            shape=(2,),
-            dtype=np.float64
-        )
-
-        self.block_cog = block_cog
-        self.damping = damping
-        self.render_action = render_action
-
+        Initialize the Flow Matching model.
+        Using existing components from fm.py
         """
-        If human-rendering is used, `self.window` will be a reference
-        to the window that we draw to. `self.clock` will be a clock that is used
-        to ensure that the environment is rendered at the correct framerate in
-        human-mode. They will remain `None` until human-mode is used for the
-        first time.
-        """
-        self.window = None
-        self.clock = None
-        self.screen = None
-
-        self.space = None
-        self.teleop = None
-        self.render_buffer = None
-        self.latest_action = None
-        self.reset_to_state = reset_to_state
-
-        self._setup()
-
-    def reset(self):
-        self._setup()
-        if self.block_cog is not None:
-            self.block.center_of_gravity = self.block_cog
-        if self.damping is not None:
-            self.space.damping = self.damping
-
-        # use legacy RandomState for compatiblity
-        state = self.reset_to_state
-        if state is None:
+        self.obs_horizon = obs_horizon
+        self.pred_horizon = pred_horizon
+        self.action_dim = action_dim
+        self.num_particles = num_particles
+        
+        # Set random seed for reproducibility
+        if seed is not None:
+            torch.manual_seed(seed)
+            np.random.seed(seed)
             
-            state = np.array([
-                self.np_random.integers(50, 450), self.np_random.integers(50, 450),
-                self.np_random.integers(100, 400), self.np_random.integers(100, 400),
-                self.np_random.uniform(-np.pi, np.pi)
-                ])
-        self._set_state(state)
-
-        obs = self._get_obs()
-        info = self._get_info()
-        return obs, info
-
-    def step(self, action):
-        dt = 1.0 / self.sim_hz
-        self.n_contact_points = 0
-        n_steps = self.sim_hz // self.control_hz
-        if action is not None:
-            self.latest_action = action
-            for i in range(n_steps):
-                # Step PD control.
-                # self.agent.velocity = self.k_p * (act - self.agent.position)    # P control works too.
-                acceleration = self.k_p * (action - self.agent.position) + self.k_v * (Vec2d(0, 0) - self.agent.velocity)
-                self.agent.velocity += acceleration * dt
-
-                # Step physics.
-                self.space.step(dt)
-
-        # compute reward
-        goal_body = self._get_goal_pose_body(self.goal_pose)
-        goal_geom = pymunk_to_shapely(goal_body, self.block.shapes)
-        block_geom = pymunk_to_shapely(self.block, self.block.shapes)
-
-        intersection_area = goal_geom.intersection(block_geom).area
-        goal_area = goal_geom.area
-        coverage = intersection_area / goal_area
-        reward = np.clip(coverage / self.success_threshold, 0, 1)
-        done = coverage > self.success_threshold
-        terminated = done
-        truncated = done
-
-        observation = self._get_obs()
-        info = self._get_info()
-
-        return observation, reward, terminated, truncated, info
-
-    def render(self, mode):
-        return self._render_frame(mode)
-
-    def teleop_agent(self):
-        TeleopAgent = collections.namedtuple('TeleopAgent', ['act'])
-        def act(obs):
-            act = None
-            mouse_position = pymunk.pygame_util.from_pygame(Vec2d(*pygame.mouse.get_pos()), self.screen)
-            if self.teleop or (mouse_position - self.agent.position).length < 30:
-                self.teleop = True
-                act = mouse_position
-            return act
-        return TeleopAgent(act)
-
-    def _get_obs(self):
-        obs = np.array(
-            tuple(self.agent.position) \
-            + tuple(self.block.position) \
-            + (self.block.angle % (2 * np.pi),))
-        return obs
-
-    def _get_goal_pose_body(self, pose):
-        mass = 1
-        inertia = pymunk.moment_for_box(mass, (50, 100))
-        body = pymunk.Body(mass, inertia)
-        # preserving the legacy assignment order for compatibility
-        # the order here dosn't matter somehow, maybe because CoM is aligned with body origin
-        body.position = pose[:2].tolist()
-        body.angle = pose[2]
-        return body
-
-    def _get_info(self):
-        n_steps = self.sim_hz // self.control_hz
-        n_contact_points_per_step = int(np.ceil(self.n_contact_points / n_steps))
-        info = {
-            'pos_agent': np.array(self.agent.position),
-            'vel_agent': np.array(self.agent.velocity),
-            'block_pose': np.array(list(self.block.position) + [self.block.angle]),
-            'goal_pose': self.goal_pose,
-            'n_contacts': n_contact_points_per_step}
-        return info
-    
-    def _get_state(self):
-        state = np.array(
-            tuple(self.agent.position) \
-            + tuple(self.block.position) \
-            + (self.block.angle % (2 * np.pi),))
-        return state
-
-    def _render_frame(self, mode):
-
-        if self.window is None and mode == "human":
-            pygame.init()
-            pygame.display.init()
-            self.window = pygame.display.set_mode((self.window_size, self.window_size))
-        if self.clock is None and mode == "human":
-            self.clock = pygame.time.Clock()
-
-        canvas = pygame.Surface((self.window_size, self.window_size))
-        canvas.fill((255, 255, 255))
-        self.screen = canvas
-
-        draw_options = DrawOptions(canvas)
-
-        # Draw goal pose.
-        goal_body = self._get_goal_pose_body(self.goal_pose)
-        for shape in self.block.shapes:
-            goal_points = [pymunk.pygame_util.to_pygame(goal_body.local_to_world(v), draw_options.surface) for v in shape.get_vertices()]
-            goal_points += [goal_points[0]]
-            pygame.draw.polygon(canvas, self.goal_color, goal_points)
-
-        # Draw agent and block.
-        self.space.debug_draw(draw_options)
-
-        if mode == "human":
-            # The following line copies our drawings from `canvas` to the visible window
-            self.window.blit(canvas, canvas.get_rect())
-            pygame.event.pump()
-            pygame.display.update()
-
-            # the clock is aleady ticked during in step for "human"
-
-
-        img = np.transpose(
-                np.array(pygame.surfarray.pixels3d(canvas)), axes=(1, 0, 2)
+        # Create flow matching scheduler
+        self.flow_scheduler = FlowMatchingScheduler()
+        
+        # Flag to check if model is reset
+        self.is_reset = False
+        
+        # Device selection
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+    def reset(self):
+        """Reset the model state"""
+        self.is_reset = True
+        
+    def load_model(self, checkpoint_path):
+        """Load model weights from checkpoint"""
+        # Set weights_only to False to handle numpy scalar objects in the checkpoint
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        
+        # Initialize vision encoder if not already created
+        if not hasattr(self, 'vision_encoder'):
+            self.vision_encoder = fm.get_resnet('resnet18')
+            self.vision_encoder = fm.replace_bn_with_gn(self.vision_encoder)
+            
+        # Initialize noise prediction network if not already created
+        if not hasattr(self, 'noise_pred_net'):
+            # ResNet18 has output dim of 512
+            vision_feature_dim = 512
+            # agent_pos is 2 dimensional
+            lowdim_obs_dim = 2
+            # observation feature has 514 dims in total per step
+            obs_dim = vision_feature_dim + lowdim_obs_dim
+            
+            self.noise_pred_net = fm.ConditionalUnet1D(
+                input_dim=self.action_dim,
+                global_cond_dim=obs_dim*self.obs_horizon
             )
-        img = cv2.resize(img, (self.render_size, self.render_size))
-        if self.render_action:
-            if self.render_action and (self.latest_action is not None):
-                action = np.array(self.latest_action)
-                coord = (action / 512 * 96).astype(np.int32)
-                marker_size = int(8/96*self.render_size)
-                thickness = int(1/96*self.render_size)
-                cv2.drawMarker(img, coord,
-                    color=(255,0,0), markerType=cv2.MARKER_CROSS,
-                    markerSize=marker_size, thickness=thickness)
-        return img
+        
+        # Load state dicts from checkpoint
+        if 'model_state_dict' in checkpoint:
+            model_dict = checkpoint['model_state_dict']
+            
+            # Extract vision_encoder and noise_pred_net parts
+            if 'vision_encoder.' in next(iter(model_dict)):
+                # The state dict has prefixes
+                self.vision_encoder.load_state_dict({k.replace('vision_encoder.', ''): v for k, v in model_dict.items() 
+                                            if k.startswith('vision_encoder.')})
+                self.noise_pred_net.load_state_dict({k.replace('noise_pred_net.', ''): v for k, v in model_dict.items() 
+                                            if k.startswith('noise_pred_net.')})
+            else:
+                # Direct loading
+                nets = torch.nn.ModuleDict({
+                    'vision_encoder': self.vision_encoder,
+                    'noise_pred_net': self.noise_pred_net
+                })
+                nets.load_state_dict(model_dict)
+                
+        # Move models to device
+        self.vision_encoder = self.vision_encoder.to(self.device)
+        self.noise_pred_net = self.noise_pred_net.to(self.device)
+        
+        # Set models to evaluation mode
+        self.vision_encoder.eval()
+        self.noise_pred_net.eval()
+        
+        # Also load the data stats if available in the checkpoint
+        if 'stats' in checkpoint:
+            self.stats = checkpoint['stats']
+        
+    def sample(self, shape, image=None, agent_pos=None, global_cond=None, steps=100):
+        """
+        Sample action sequences using flow matching.
+        """
+        assert self.is_reset, "Model must be reset before sampling"
+        
+        B = shape[0]
+        
+        with torch.no_grad():
+            # Prepare observation conditioning
+            if global_cond is not None:
+                # Using state-based approach
+                obs_cond = global_cond
+            elif image is not None and agent_pos is not None:
+                # Using vision-based approach
+                # Get image features
+                image_features = self.vision_encoder(image.flatten(end_dim=1))
+                image_features = image_features.reshape(*image.shape[:2], -1)
+                
+                # Concatenate vision feature and low-dim obs
+                obs_features = torch.cat([image_features, agent_pos], dim=-1)
+                obs_cond = obs_features.flatten(start_dim=1)
+            else:
+                raise ValueError("Either global_cond or (image, agent_pos) must be provided")
+                
+            # Initialize x_t from Gaussian noise (x0)
+            x_t = torch.randn(shape, device=self.device)
+            
+            # Set up flow matching integration
+            self.flow_scheduler.set_timesteps(steps)
+            
+            # Integrate the ODE: dx/dt = v(x,t)
+            # Using Euler method
+            for i, t in enumerate(self.flow_scheduler.timesteps):
+                # Create batch of current timestep
+                t_batch = torch.ones((B,), device=self.device) * t
+                
+                # Predict velocity at current point
+                v_t = self.noise_pred_net(
+                    sample=x_t,
+                    timestep=t_batch,
+                    global_cond=obs_cond
+                )
+                
+                # Euler integration step
+                if i < len(self.flow_scheduler.timesteps) - 1:
+                    # dt = t_{i+1} - t_i
+                    dt = self.flow_scheduler.timesteps[i + 1] - t
+                    # x_{t+dt} = x_t + v_t * dt
+                    x_t = x_t + dt * v_t
+            
+            # The final state is our generated action sequence
+            return x_t
 
-
-    def close(self):
-        if self.window is not None:
-            pygame.display.quit()
-            pygame.quit()
-
-    def _handle_collision(self, arbiter, space, data):
-        self.n_contact_points += len(arbiter.contact_point_set.points)
-
-    def _set_state(self, state):
-        if isinstance(state, np.ndarray):
-            state = state.tolist()
-        pos_agent = state[:2]
-        pos_block = state[2:4]
-        rot_block = state[4]
-        self.agent.position = pos_agent
-        # setting angle rotates with respect to center of mass
-        # therefore will modify the geometric position
-        # if not the same as CoM
-        # therefore should be modified first.
-        if self.legacy:
-            # for compatiblity with legacy data
-            self.block.position = pos_block
-            self.block.angle = rot_block
+def benchmark_flow_matching(checkpoint_path, diffusion_steps=16, mode='vision', episodes=100):
+    """
+    Benchmark function for flow matching model.
+    
+    Args:
+        checkpoint_path: Path to the checkpoint file
+        diffusion_steps: Number of steps for the flow matching integration
+        mode: 'vision' or 'state' - which observation type to use
+        episodes: Number of episodes to run
+        
+    Returns:
+        Dictionary with average reward, average steps, and average inference time
+    """
+    print(f"Benchmarking flow matching with {diffusion_steps} steps in {mode} mode")
+    
+    # Load model and statistics
+    if mode == 'vision':
+        try:
+            with open('./vision_data_stats.pkl', 'rb') as f:
+                data_stats = pickle.load(f)
+        except:
+            # If we can't load the stats, we'll try to get them from the checkpoint
+            data_stats = None
+    else:  # state mode
+        try:
+            with open('./pusht_data_stats.pkl', 'rb') as f:
+                data_stats = pickle.load(f)
+        except:
+            # If we can't load the stats, we'll try to get them from the checkpoint
+            data_stats = None
+    
+    # Create flow matching model
+    model = FlowMatchingModel(
+        obs_horizon=2,
+        pred_horizon=16,
+        action_dim=2,
+        num_particles=4,
+        seed=12345
+    )
+    
+    # Load checkpoint
+    model.load_model(checkpoint_path)
+    
+    # If we couldn't load the stats file, use the stats from the checkpoint
+    if data_stats is None:
+        if hasattr(model, 'stats'):
+            data_stats = model.stats
         else:
-            self.block.angle = rot_block
-            self.block.position = pos_block
-
-        # Run physics to take effect
-        self.space.step(1.0 / self.sim_hz)
-
-    def _set_state_local(self, state_local):
-        agent_pos_local = state_local[:2]
-        block_pose_local = state_local[2:]
-        tf_img_obj = st.AffineTransform(
-            translation=self.goal_pose[:2],
-            rotation=self.goal_pose[2])
-        tf_obj_new = st.AffineTransform(
-            translation=block_pose_local[:2],
-            rotation=block_pose_local[2]
-        )
-        tf_img_new = st.AffineTransform(
-            matrix=tf_img_obj.params @ tf_obj_new.params
-        )
-        agent_pos_new = tf_img_new(agent_pos_local)
-        new_state = np.array(
-            list(agent_pos_new[0]) + list(tf_img_new.translation) \
-                + [tf_img_new.rotation])
-        self._set_state(new_state)
-        return new_state
-
-    def _setup(self):
-        self.space = pymunk.Space()
-        self.space.gravity = 0, 0
-        self.space.damping = 0
-        self.teleop = False
-        self.render_buffer = list()
-
-        # Add walls.
-        walls = [
-            self._add_segment((5, 506), (5, 5), 2),
-            self._add_segment((5, 5), (506, 5), 2),
-            self._add_segment((506, 5), (506, 506), 2),
-            self._add_segment((5, 506), (506, 506), 2)
-        ]
-        self.space.add(*walls)
-
-        # Add agent, block, and goal zone.
-        self.agent = self.add_circle((256, 400), 15)
-        self.block = self.add_tee((256, 300), 0)
-        self.goal_color = pygame.Color('LightGreen')
-        self.goal_pose = np.array([256,256,np.pi/4])  # x, y, theta (in radians)
-
-        # Add collision handeling
-        self.collision_handeler = self.space.add_collision_handler(0, 0)
-        self.collision_handeler.post_solve = self._handle_collision
-        self.n_contact_points = 0
-
-        self.max_score = 50 * 100
-        self.success_threshold = 0.95    # 95% coverage.
-
-    def _add_segment(self, a, b, radius):
-        shape = pymunk.Segment(self.space.static_body, a, b, radius)
-        shape.color = pygame.Color('LightGray')    # https://htmlcolorcodes.com/color-names
-        return shape
-
-    def add_circle(self, position, radius):
-        body = pymunk.Body(body_type=pymunk.Body.KINEMATIC)
-        body.position = position
-        body.friction = 1
-        shape = pymunk.Circle(body, radius)
-        shape.color = pygame.Color('RoyalBlue')
-        self.space.add(body, shape)
-        return body
-
-    def add_box(self, position, height, width):
-        mass = 1
-        inertia = pymunk.moment_for_box(mass, (height, width))
-        body = pymunk.Body(mass, inertia)
-        body.position = position
-        shape = pymunk.Poly.create_box(body, (height, width))
-        shape.color = pygame.Color('LightSlateGray')
-        self.space.add(body, shape)
-        return body
-
-    def add_tee(self, position, angle, scale=30, color='LightSlateGray', mask=pymunk.ShapeFilter.ALL_MASKS()):
-        mass = 1
-        length = 4
-        vertices1 = [(-length*scale/2, scale),
-                                 ( length*scale/2, scale),
-                                 ( length*scale/2, 0),
-                                 (-length*scale/2, 0)]
-        inertia1 = pymunk.moment_for_poly(mass, vertices=vertices1)
-        vertices2 = [(-scale/2, scale),
-                                 (-scale/2, length*scale),
-                                 ( scale/2, length*scale),
-                                 ( scale/2, scale)]
-        inertia2 = pymunk.moment_for_poly(mass, vertices=vertices1)
-        body = pymunk.Body(mass, inertia1 + inertia2)
-        shape1 = pymunk.Poly(body, vertices1)
-        shape2 = pymunk.Poly(body, vertices2)
-        shape1.color = pygame.Color(color)
-        shape2.color = pygame.Color(color)
-        shape1.filter = pymunk.ShapeFilter(mask=mask)
-        shape2.filter = pymunk.ShapeFilter(mask=mask)
-        body.center_of_gravity = (shape1.center_of_gravity + shape2.center_of_gravity) / 2
-        body.position = position
-        body.angle = angle
-        body.friction = 1
-        self.space.add(body, shape1, shape2)
-        return body
-
-class PushTImageEnv(PushTEnv):
-    metadata = {"render.modes": ["rgb_array"], "video.frames_per_second": 10}
-
-    def __init__(self,
-            legacy=False,
-            block_cog=None,
-            damping=None,
-            render_size=96,
-            seed=1234):
-        super().__init__(
-            legacy=legacy,
-            block_cog=block_cog,
-            damping=damping,
-            render_size=render_size,
-            render_action=False,
-            seed=seed)
-        ws = self.window_size
-        self.observation_space = spaces.Dict({
-            'image': spaces.Box(
-                low=0,
-                high=1,
-                shape=(3,render_size,render_size),
-                dtype=np.float32
-            ),
-            'agent_pos': spaces.Box(
-                low=0,
-                high=ws,
-                shape=(2,),
-                dtype=np.float32
-            )
-        })
-        self.render_cache = None
-
-    def _get_obs(self):
-        img = super()._render_frame(mode='rgb_array')
-
-        agent_pos = np.array(self.agent.position)
-        img_obs = np.moveaxis(img.astype(np.float32) / 255, -1, 0)
-        obs = {
-            'image': img_obs,
-            'agent_pos': agent_pos
-        }
-
-        # draw action
-        if self.latest_action is not None:
-            action = np.array(self.latest_action)
-            coord = (action / 512 * 96).astype(np.int32)
-            marker_size = int(8/96*self.render_size)
-            thickness = int(1/96*self.render_size)
-            cv2.drawMarker(img, coord,
-                color=(255,0,0), markerType=cv2.MARKER_CROSS,
-                markerSize=marker_size, thickness=thickness)
-        self.render_cache = img
-
-        return obs
-
-    def render(self, mode):
-        assert mode == 'rgb_array'
-
-        if self.render_cache is None:
-            self._get_obs()
-
-        return self.render_cache
-
-def benchmark(model, diffusion_steps=1, mode='state', dataset=None, pred_horizon=16):
-    device = torch.device('cuda')
+            raise ValueError("Could not find data stats in checkpoint or file")
     
-    if dataset is None:
-        raise ValueError("Dataset must be provided for normalization stats")
-
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
     # limit environment interaction to 350 steps before termination
     max_steps = 350
+    
+    # Create environment
     if mode == 'state':
         env = PushTEnv(seed=12345)
     elif mode == 'vision':
         env = PushTImageEnv(seed=12345)
-
-    render = False
-
-    episodes = 100
-    starts = np.zeros((episodes, 5))
-    ends = np.zeros((episodes, 5))
+    
+    # Initialize arrays to store results
     steps = np.zeros(episodes)
-    avgtimes = np.zeros(episodes)
-
-    # save rewards
-    final_rewards = np.zeros(episodes)
-    max_rewards = np.zeros(episodes)
-
-    with tqdm(total=episodes, desc="Eval PushTEnv") as pbar:
+    times = np.zeros(episodes)
+    rewards = np.zeros(episodes)
+    
+    with tqdm(total=episodes, desc=f"Evaluating Flow Matching ({diffusion_steps} steps)") as pbar:
         for ep in range(episodes):
-            reward = 0.0
-            max_reward = 0.0
+            # Reset model
+            model.reset()
             
-            # get first observation
+            # Get first observation
             obs, info = env.reset()
-            if render:
-                imgs = [env.render(mode='rgb_array')]
-            starts[ep] = env._get_state()
             
-            # keep a queue of last 2 steps of observations
-            obs_deque = collections.deque([obs] * 2, maxlen=2)
-
+            # Keep a queue of last 2 steps of observations
+            obs_deque = collections.deque([obs] * model.obs_horizon, maxlen=model.obs_horizon)
+            
             done = False
             step_idx = 0
-            eptimes = []
-        
+            ep_times = []
+            
             while not done:
-                if mode == 'vision':
-                    # Stack observations
-                    obs_stack = []
-                    pos_stack = []
-                    for obs_dict in obs_deque:
-                        img = obs_dict['image']  # This is already [C, H, W] format
-                        # Normalize to [-1, 1] to match dataset normalization
-                        if img.max() <= 1.0:  # If image is in [0,1] range, convert to [-1,1]
-                            img = img * 2.0 - 1.0
-                        obs_stack.append(img)
-                        pos_stack.append(obs_dict['agent_pos'])
+                if mode == 'state':
+                    # Stack the last obs_horizon (2) number of observations
+                    obs_seq = np.stack(obs_deque)
+                    # Normalize observation
+                    nobs = normalize_data(obs_seq, stats=data_stats['obs'])
+                    # Device transfer
+                    nobs = torch.from_numpy(nobs).unsqueeze(0).flatten(start_dim=1).to(device, dtype=torch.float32)
                     
-                    # Convert to torch tensor and add batch dimension
-                    obs_tensor = torch.from_numpy(np.stack(obs_stack)).float().to(device)
-                    # Reshape to [B, T, H, W, C] format expected by vision encoder
-                    obs_tensor = obs_tensor.permute(0, 2, 3, 1)  # [T, H, W, C]
-                    obs_tensor = obs_tensor.unsqueeze(0)  # [B, T, H, W, C]
-                    
-                    # Convert agent positions to tensor and normalize using dataset stats
-                    pos_stack = np.stack(pos_stack)
-                    pos_tensor = normalize_data(pos_stack, dataset.stats['agent_pos'])
-                    pos_tensor = torch.from_numpy(pos_tensor).float().to(device)
-                    pos_tensor = pos_tensor.unsqueeze(0)  # Shape: [1, obs_horizon, 2]
-
-                    # Generate initial noise using pred_horizon
-                    z0 = torch.randn((1, pred_horizon, 2), device=device)
-
-                    # Sample trajectory
+                    # Infer action
                     with torch.no_grad():
                         start_time = time.time()
-                        traj = model.sample_ode_shortcut(
-                            z0=z0,
-                            obs=obs_tensor,
-                            agent_pos=pos_tensor,
-                            N=diffusion_steps
+                        r = model.sample(
+                            shape=(1, model.pred_horizon, model.action_dim), 
+                            global_cond=nobs, 
+                            steps=diffusion_steps
                         )
                         end_time = time.time()
-                        eptimes.append(1000 * (end_time - start_time))
-
-                    # Get final prediction and unnormalize to [0, 512]
-                    action_pred = traj[-1].cpu().numpy()[0]  # Remove batch dim
-                    action_pred = (action_pred + 1) * 256.0
-
-                    # Take first action
-                    action = action_pred[0]
-
-                # Execute action
-                obs, reward, done, _, info = env.step(action)
-                # save observations
-                obs_deque.append(obs)
-                if render:
-                    imgs.append(env.render(mode='rgb_array'))
-
-                step_idx += 1
-                if step_idx > max_steps:
-                    done = True
-
-                max_reward = max(max_reward, reward)
-
-            ends[ep] = env._get_state()
-            steps[ep] = step_idx
-            avgtimes[ep] = np.mean(eptimes)
-            pbar.update(1)
-            pbar.set_postfix(avg_max_reward=sum(max_rewards[:ep+1])/(ep+1))
-            final_rewards[ep] = reward
-            max_rewards[ep] = max_reward
+                        ep_times.append(1000 * (end_time - start_time))
+                        
+                elif mode == 'vision':
+                    # Stack images and agent positions
+                    images = np.stack([x['image'] for x in obs_deque])
+                    agent_poses = np.stack([x['agent_pos'] for x in obs_deque])
+                    
+                    # Normalize agent positions
+                    nagent_poses = normalize_data(agent_poses, stats=data_stats['agent_pos'])
+                    
+                    # Images are already normalized in [0,1]
+                    images = torch.from_numpy(images).unsqueeze(0).to(device, dtype=torch.float32)
+                    nagent_poses = torch.from_numpy(nagent_poses).unsqueeze(0).to(device, dtype=torch.float32)
+                    
+                    # Infer action
+                    with torch.no_grad():
+                        start_time = time.time()
+                        r = model.sample(
+                            shape=(1, model.pred_horizon, model.action_dim), 
+                            image=images, 
+                            agent_pos=nagent_poses, 
+                            steps=diffusion_steps
+                        )
+                        end_time = time.time()
+                        ep_times.append(1000 * (end_time - start_time))
+                
+                # Unnormalize action
+                naction = r.detach().to('cpu').numpy()
+                naction = naction[0]
+                if mode == 'state':
+                    action_pred = unnormalize_data(naction, stats=data_stats['action'])
+                elif mode == 'vision':
+                    action_pred = unnormalize_data(naction, stats=data_stats['action'])
+                
+                # Only take action_horizon number of actions
+                start = model.obs_horizon - 1
+                end = start + 8  # action_horizon = 8
+                action = action_pred[start:end, :]
+                
+                # Execute action_horizon number of steps without replanning
+                for i in range(len(action)):
+                    # Stepping env
+                    obs, reward, done, _, info = env.step(action[i])
+                    # Save observations
+                    obs_deque.append(obs)
+                    
+                    step_idx += 1
+                    if step_idx > max_steps:
+                        done = True
+                    if done:
+                        break
             
-    print(f'Average max reward: {sum(max_rewards)/episodes}')
-    return max_rewards, starts, ends
+            steps[ep] = step_idx
+            times[ep] = np.mean(ep_times)
+            rewards[ep] = reward
+            
+            pbar.update(1)
+            pbar.set_postfix(avg_reward=sum(rewards[:ep+1])/(ep+1))
+    
+    results = {
+        'avg_reward': float(np.mean(rewards)),
+        'avg_steps': float(np.mean(steps)),
+        'avg_time_ms': float(np.mean(times)),
+        'success_rate': float(np.mean(rewards == 1.0))  # Added success rate metric
+    }
+    
+    return results
 
-def save_results(epoch, rewards_dict, filename='benchmark_results.txt'):
-    """Save results for an epoch to file"""
-    with open(filename, 'a') as f:
-        f.write(f"\nResults for epoch {epoch}:\n")
-        for steps, reward in rewards_dict.items():
-            f.write(f"Diffusion steps {steps}: {reward}\n")
-        f.write("-" * 50 + "\n")
+def main():
+    """Main function to run benchmarks with different configurations"""
+    parser = argparse.ArgumentParser(description='Flow Matching Benchmark')
+    parser.add_argument('--mode', type=str, choices=['vision', 'state'], default='vision',
+                        help='Observation mode: vision or state')
+    parser.add_argument('--steps', type=int, nargs='+', default=[1, 2, 4, 8, 16, 32],
+                        help='Number of flow matching steps to benchmark')
+    parser.add_argument('--episodes', type=int, default=100,
+                        help='Number of episodes to evaluate')
+    parser.add_argument('--checkpoint_epoch', type=int, nargs='+', default=[40, 60, 80, 100],
+                        help='Which checkpoint epochs to evaluate')
+    parser.add_argument('--output', type=str, default='flow_matching_results.txt',
+                        help='Output file for results')
+    
+    args = parser.parse_args()
+    
+    # Open output file
+    with open(args.output, 'w') as f:
+        f.write(f"Flow Matching Benchmark Results\n")
+        f.write(f"Mode: {args.mode}, Episodes: {args.episodes}\n")
+        f.write("=" * 100 + "\n")
+        f.write(f"{'Epoch':<10}{'Steps':<10}{'Avg Reward':<15}{'Avg Steps':<15}{'Avg Time (ms)':<15}{'Success Rate':<15}\n")
+        f.write("-" * 100 + "\n")
+        
+        # Run benchmarks for each epoch and step count
+        for epoch in args.checkpoint_epoch:
+            checkpoint_path = f'/home/imahajan/diffusion/checkpoints/flow_matching_epoch_{epoch}.pt'
+            
+            if not os.path.exists(checkpoint_path):
+                print(f"Checkpoint {checkpoint_path} not found, skipping...")
+                continue
+            
+            for steps in args.steps:
+                print(f"\n===== Evaluating checkpoint from epoch {epoch} with {steps} steps =====")
+                
+                try:
+                    results = benchmark_flow_matching(
+                        checkpoint_path=checkpoint_path,
+                        diffusion_steps=steps,
+                        mode=args.mode,
+                        episodes=args.episodes
+                    )
+                    
+                    # Print and write results
+                    f.write(f"{epoch:<10}{steps:<10}{results['avg_reward']:<15.4f}{results['avg_steps']:<15.1f}{results['avg_time_ms']:<15.2f}{results['success_rate']:<15.4f}\n")
+                    f.flush()  # Make sure it's written immediately
+                    
+                    print(f"Epoch {epoch}, Steps {steps}:")
+                    print(f"  Average Reward: {results['avg_reward']:.4f}")
+                    print(f"  Average Steps: {results['avg_steps']:.1f}")
+                    print(f"  Average Inference Time: {results['avg_time_ms']:.2f} ms")
+                    print(f"  Success Rate: {results['success_rate']:.4f}")
+                    
+                except Exception as e:
+                    error_msg = f"Error evaluating epoch {epoch} with {steps} steps: {str(e)}"
+                    print(error_msg)
+                    f.write(f"{epoch:<10}{steps:<10}ERROR: {str(e)}\n")
+                    f.flush()
+        
+        f.write("=" * 100 + "\n")
+        f.write(f"Benchmark completed at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
 
 if __name__ == "__main__":
-    # Initialize dataset first for normalization stats
-    dataset_path = "pusht_cchi_v7_replay.zarr.zip"
-    pred_horizon = 16
-    obs_horizon = 2
-    action_horizon = 8
-    
-    print("Loading dataset for normalization stats...")
-    dataset = PushTImageDataset(
-        dataset_path=dataset_path,
-        pred_horizon=pred_horizon,
-        obs_horizon=obs_horizon,
-        action_horizon=action_horizon
-    )
-
-    # Initialize models
-    vision_encoder = VisionEncoder(
-        input_channels=3,
-        output_dim=512,
-        obs_horizon=obs_horizon
-    ).to(device)
-
-    # Vision encoder outputs 512-dim per timestep
-    vision_dim = 512
-    pos_dim = 2
-    global_cond_dim = (vision_dim + pos_dim) * obs_horizon
-
-    noise_pred_net = ConditionalUnet1D(
-        input_dim=2,
-        global_cond_dim=global_cond_dim,
-        diffusion_step_embed_dim=256,
-        down_dims=[256, 512, 1024],
-        kernel_size=5,
-        n_groups=8
-    ).to(device)
-
-    # Create flow matching model
-    flow_model = VisionShortcutModel(
-        model=noise_pred_net,
-        vision_encoder=vision_encoder,
-        num_steps=100,
-        device=device
-    )
-
-    # Clear previous results file
-    open('benchmark_results.txt', 'w').close()
-
-    # Test epochs 40, 60, 80, 100
-    for epoch in [40, 60, 80, 100]:
-        print(f'\nTesting epoch {epoch}')
-        try:
-            checkpoint = torch.load(
-                f'/home/imahajan/diffusion/checkpoints/epoch_{epoch}.pt',
-                map_location=device,
-                weights_only=False  # Explicitly set for PyTorch 2.6
-            )
-            noise_pred_net.load_state_dict(checkpoint['model_state_dict'])
-            vision_encoder.load_state_dict(checkpoint['vision_encoder_state_dict'])
-            print(f"Successfully loaded checkpoint for epoch {epoch}")
-        except Exception as e:
-            print(f"Failed to load checkpoint for epoch {epoch}: {e}")
-            continue
-        
-        # Dictionary to store results for this epoch
-        results = {}
-        
-        # Test different diffusion steps
-        for steps in [1, 2, 4, 8, 16, 32]:
-            print(f'\nTesting {steps} diffusion steps')
-            rewards, _, _ = benchmark(
-                flow_model, 
-                steps, 
-                mode='vision', 
-                dataset=dataset,
-                pred_horizon=pred_horizon
-            )
-            results[steps] = np.mean(rewards)
-        
-        # Save results for this epoch
-        save_results(epoch, results)
-
-    print("\nBenchmarking complete! Results saved to benchmark_results.txt")
+    main()

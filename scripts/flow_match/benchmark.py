@@ -27,7 +27,7 @@ from skvideo.io import vwrite
 from IPython.display import Video
 import time
 
-from fm import FlowMatchingScheduler
+from flow_match.fm import FlowMatchingScheduler
 import torch.nn as nn
 
 # from imm.state_nn import RoboIMM as ImmState
@@ -674,6 +674,30 @@ def unnormalize_data(ndata, stats):
     data = ndata * (stats['max'] - stats['min']) + stats['min']
     return data
 
+# In[13]:
+
+
+
+# immstate = ImmState(
+#     sigma_data=state_data_stats['action_normalized']['std'].mean(),
+#     obs_horizon=2,
+#     pred_horizon=16,
+#     num_particles=4,
+#     seed=12345
+# )
+# immstate.load_model('imm/ckpts/state.pth')
+
+# immvision = ImmVision(
+#     sigma_data=vision_data_stats['action_normalized']['std'].mean(),
+#     obs_horizon=2,
+#     pred_horizon=16,
+#     num_particles=4,
+#     seed=12345
+# )
+# immvision.load_model('imm/ckpts/model_checkpoint_15_0_0.039065733551979065.pth')
+
+# # In[14]:
+
 
 
 def benchmark(model, diffusion_steps=1, mode='state'):
@@ -782,13 +806,53 @@ def benchmark(model, diffusion_steps=1, mode='state'):
             pbar.set_postfix(avg_reward=sum(final_rewards[:ep+1])/(ep+1))
             final_rewards[ep] = reward
     print(f'Final reward at {diffusion_steps} steps: {sum(final_rewards)/episodes}')
-
-    #pipe to csv epochs, steps, final_reward/episodes
-    with open('flow_matching_benchmark.csv', 'a') as f:
-        f.write(f'{diffusion_steps}, {sum(final_rewards)/episodes}\n')
     return final_rewards, starts, ends
 
+# In[7]:
 
+
+# b1 = benchmark(immstate, 1)
+# b2 = benchmark(immstate, 2)
+# b4 = benchmark(immstate, 4)
+# b8 = benchmark(immstate, 8)
+# b16 = benchmark(immstate, 16)
+
+# In[16]:
+
+# print('Flow Matching (40 epochs)')
+# checkpoint_path = '/home/imahajan/diffusion/checkpoints/flow_matching_epoch_40.pt'
+# bf1 = benchmark(checkpoint_path, 1)
+# bf2 = benchmark(checkpoint_path, 2)
+# bf4 = benchmark(checkpoint_path, 4)
+# bf8 = benchmark(checkpoint_path, 8)
+# bf16 = benchmark(checkpoint_path, 16)
+# bf32 = benchmark(checkpoint_path, 32)
+
+
+# print('20 epochs')
+# immvision.load_model('imm/ckpts/model_checkpoint_15_0_0.039065733551979065.pth')
+# bv1 = benchmark(immvision, 1, mode='vision')
+# bv2 = benchmark(immvision, 2, mode='vision')
+# bv4 = benchmark(immvision, 4, mode='vision')
+# bv8 = benchmark(immvision, 8, mode='vision')
+# bv16 = benchmark(immvision, 16, mode='vision')
+# bv32 = benchmark(immvision, 32, mode='vision')
+# print('80 epochs')
+# immvision.load_model('imm/ckpts/vision_60.pth')
+# bv1 = benchmark(immvision, 1, mode='vision')
+# bv2 = benchmark(immvision, 2, mode='vision')
+# bv4 = benchmark(immvision, 4, mode='vision')
+# bv8 = benchmark(immvision, 8, mode='vision')
+# bv16 = benchmark(immvision, 16, mode='vision')
+# bv32 = benchmark(immvision, 32, mode='vision')
+# print('100 epochs')
+# immvision.load_model('imm/ckpts/vision_75.pth')
+# bv1 = benchmark(immvision, 1, mode='vision')
+# bv2 = benchmark(immvision, 2, mode='vision')
+# bv4 = benchmark(immvision, 4, mode='vision')
+# bv8 = benchmark(immvision, 8, mode='vision')
+# bv16 = benchmark(immvision, 16, mode='vision')
+# bv32 = benchmark(immvision, 32, mode='vision')
 
 # Add this wrapper class for your flow matching model
 class FlowMatchingWrapper:
@@ -808,7 +872,7 @@ class FlowMatchingWrapper:
         self.stats = checkpoint.get('stats', None)
         
         # Create model architecture
-        from fm import get_resnet, ConditionalUnet1D, replace_bn_with_gn
+        from flow_match.fm import get_resnet, ConditionalUnet1D, replace_bn_with_gn
         
         # Vision encoder
         self.vision_encoder = get_resnet('resnet18')
@@ -892,16 +956,6 @@ class FlowMatchingWrapper:
 # In[17]:
 # Add this to your main code to run the flow matching benchmark
 
-print('Flow Matching (20 epochs)')
-checkpoint_path = '/home/imahajan/diffusion/checkpoints/flow_matching_epoch_20.pt'
-flow_model = FlowMatchingWrapper(checkpoint_path)
-bf1 = benchmark(flow_model, 1, mode='vision')
-bf2 = benchmark(flow_model, 2, mode='vision')
-bf4 = benchmark(flow_model, 4, mode='vision')
-bf8 = benchmark(flow_model, 8, mode='vision')
-bf16 = benchmark(flow_model, 16, mode='vision')
-bf32 = benchmark(flow_model, 32, mode='vision')
-
 print('Flow Matching (40 epochs)')
 checkpoint_path = '/home/imahajan/diffusion/checkpoints/flow_matching_epoch_40.pt'
 flow_model = FlowMatchingWrapper(checkpoint_path)
@@ -941,5 +995,3 @@ bf4 = benchmark(flow_model, 4, mode='vision')
 bf8 = benchmark(flow_model, 8, mode='vision')
 bf16 = benchmark(flow_model, 16, mode='vision')
 bf32 = benchmark(flow_model, 32, mode='vision')
-
-
